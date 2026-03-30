@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Training / checkpoint / vocab outputs
+workdir/
+workdir*/
+
+# Batch / Slurm logs
+*.err
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo

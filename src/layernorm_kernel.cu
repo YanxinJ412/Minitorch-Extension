@@ -46,17 +46,47 @@ __global__ void ker_layer_norm(T *ln_res, T *vars, T *means, const T *inp,
   
   // Step 1
   float l_sum = 0;
+  float l_sum_sq = 0;
   const float4 *inp_f4 = reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_size;  
-  for (uint idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float4 val = inp_f4[idx];
+  for (uint i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    float4 val = inp_f4[i];
     l_sum += val.x + val.y + val.z + val.w;
+    l_sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
   }
 
   // Step 2
-
+  float buffer[2];
+  buffer[0] = l_sum;
+  buffer[1] = l_sum_sq;
+  blockReduce<ReduceType::kSum, 2>(buffer);
+  l_sum = buffer[0];
+  l_sum_sq = buffer[1];
+  __shared__ float mean, var, rsqrt_var;
+  if (threadIdx.x == 0) {
+    mean = l_sum / (hidden_size * 4);
+    var = l_sum_sq / (hidden_size * 4) - mean * mean + LN_EPSILON;
+    rsqrt_var = rsqrtf(var);
+    if (means) means[blockIdx.x] = mean;
+    if (vars) vars[blockIdx.x] = var;
+  }
+  __syncthreads();
   // Step 3
+  float4 *out_f4 = reinterpret_cast<float4 *>(ln_res) + blockIdx.x * hidden_size;  
+  const float4 *scale_f4 = reinterpret_cast<const float4 *>(scale);
+  const float4 *bias_f4 = reinterpret_cast<const float4 *>(bias);
+  for (uint i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    float4 val = inp_f4[i];
+    float4 scale = scale_f4[i];
+    float4 bias = bias_f4[i];
+    float4 out_val;
+    out_val.x = scale.x * (val.x - mean) * rsqrt_var + bias.x;
+    out_val.y = scale.y * (val.y - mean) * rsqrt_var + bias.y;
+    out_val.z = scale.z * (val.z - mean) * rsqrt_var + bias.z;
+    out_val.w = scale.w * (val.w - mean) * rsqrt_var + bias.w;
+    out_f4[i] = out_val;
+  }
   
-  assert(false && "Not Implemented");
+  // assert(false && "Not Implemented");
   /// END ASSIGN4_2_1
 }
 
@@ -178,14 +208,38 @@ __global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
   cg::thread_block_tile<TILE_DIM> g = cg::tiled_partition<TILE_DIM>(b);
 
   // Step 1
-
+  float dgamma = 0.f;
+  float dbetta = 0.f;
+  int col = blockIdx.x * TILE_DIM + threadIdx.x;
+  for (int row = threadIdx.y; row < rows; row += blockDim.y) {
+    if (col < width) {
+      int idx = row * width + col;
+      float dy = out_grad[idx];
+      float xhat = (inp[idx] - means[row]) * rsqrtf(vars[row]);
+      dgamma += dy * xhat;
+      dbetta += dy;
+    }
+  }
   // Step 2
+  betta_buffer[threadIdx.y][threadIdx.x] = dbetta;
+  gamma_buffer[threadIdx.y][threadIdx.x] = dgamma;
+  __syncthreads();
   
   // Step 3
-  
-  // Step 4
+  float reduce_dbetta = betta_buffer[threadIdx.x][threadIdx.y];
+  float reduce_dgamma = gamma_buffer[threadIdx.x][threadIdx.y];
 
-  assert(false && "Not Implemented");
+  for (int offset = TILE_DIM / 2; offset > 0; offset /= 2) {
+    reduce_dbetta += g.shfl_down(reduce_dbetta, offset);
+    reduce_dgamma += g.shfl_down(reduce_dgamma, offset);
+  }
+  // Step 4
+  int out_col = blockIdx.x * TILE_DIM + threadIdx.y;
+  if (threadIdx.x == 0 && out_col < width) {
+    gamma_grad[out_col] = reduce_dgamma;
+    betta_grad[out_col] = reduce_dbetta;
+  }
+  // assert(false && "Not Implemented");
   /// END ASSIGN4_2_2
 }
 
@@ -233,14 +287,68 @@ __global__ void ker_ln_bw_dinp(T *inp_grad, const T *out_grad, const T *inp,
   // 4. Compute final gradient
   
   // Step 1
- 
+  const float mean = means[blockIdx.x];
+  const float var = vars[blockIdx.x];
+  const float rsqrt_var = rsqrtf(var);
+  const float4 *out_grad_f4 = reinterpret_cast<const float4 *>(out_grad) + blockIdx.x * hidden_dim;
+  const float4 *inp_f4 = reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_dim;
+  const float4 *gamma_f4 = reinterpret_cast<const float4 *>(gamma);
+  float sum_dxhat = 0.f;
+  float sum_dxhat_xhat = 0.f;
   // Step 2
+  for (uint i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+    float4 dy = out_grad_f4[i];
+    float4 x = inp_f4[i];
+    float4 g = gamma_f4[i];
+    float dxhatx = dy.x * g.x;
+    float dxhaty = dy.y * g.y;
+    float dxhatz = dy.z * g.z;
+    float dxhatw = dy.w * g.w;
+    float xhatx = (x.x - mean) * rsqrt_var;
+    float xhaty = (x.y - mean) * rsqrt_var;
+    float xhatz = (x.z - mean) * rsqrt_var;
+    float xhatw = (x.w - mean) * rsqrt_var;
+    sum_dxhat += dxhatx + dxhaty + dxhatz + dxhatw;
+    sum_dxhat_xhat += dxhatx * xhatx + dxhaty * xhaty + dxhatz * xhatz + dxhatw * xhatw;
+  }
    
   // Step 3
+  float buffer[2];
+  buffer[0] = sum_dxhat;
+  buffer[1] = sum_dxhat_xhat;
+  blockReduce<ReduceType::kSum, 2>(buffer);
+  sum_dxhat = buffer[0];
+  sum_dxhat_xhat = buffer[1];
+  __shared__ float s_sum_dxhat;
+  __shared__ float s_sum_dxhat_xhat;
+  if (threadIdx.x == 0) {
+    s_sum_dxhat = sum_dxhat;
+    s_sum_dxhat_xhat = sum_dxhat_xhat;
+  }
+  __syncthreads();
  
   // Step 4
-  
-  assert(false && "Not Implemented");
+  float4 *inp_grad_f4 = reinterpret_cast<float4 *>(inp_grad) + blockIdx.x * hidden_dim;
+  for (uint i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+    float4 dout;
+    float4 dy = out_grad_f4[i];
+    float4 x = inp_f4[i];
+    float4 g = gamma_f4[i];
+    float dxhatx = dy.x * g.x;
+    float dxhaty = dy.y * g.y;
+    float dxhatz = dy.z * g.z;
+    float dxhatw = dy.w * g.w;
+    float xhatx = (x.x - mean) * rsqrt_var;
+    float xhaty = (x.y - mean) * rsqrt_var;
+    float xhatz = (x.z - mean) * rsqrt_var;
+    float xhatw = (x.w - mean) * rsqrt_var;
+    dout.x = (dxhatx - (s_sum_dxhat + xhatx * s_sum_dxhat_xhat) / (hidden_dim * 4)) * rsqrt_var;
+    dout.y = (dxhaty - (s_sum_dxhat + xhaty * s_sum_dxhat_xhat) / (hidden_dim * 4)) * rsqrt_var;
+    dout.z = (dxhatz - (s_sum_dxhat + xhatz * s_sum_dxhat_xhat) / (hidden_dim * 4)) * rsqrt_var;
+    dout.w = (dxhatw - (s_sum_dxhat + xhatw * s_sum_dxhat_xhat) / (hidden_dim * 4)) * rsqrt_var;
+    inp_grad_f4[i] = dout;
+  }
+  // assert(false && "Not Implemented");
   /// END ASSIGN4_2_2
 }
 extern "C" {
@@ -251,20 +359,36 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
                          cudaStream_t stream_1, cudaStream_t stream_2) {
   
   // Allocate device memory
-  float *d_gamma_grad, *d_betta_grad, *d_inp_grad, *d_out_grad, *d_inp, *d_gamma, *d_betta, *d_vars, *d_means;
+  float *d_gamma_grad, *d_betta_grad, *d_inp_grad;
+  float *d_out_grad, *d_inp, *d_gamma, *d_betta, *d_vars, *d_means;
+
   int grad_output_size = batch_size * hidden_dim * sizeof(float);
   int gamma_betta_size = hidden_dim * sizeof(float);
   int vars_means_size = batch_size * sizeof(float);
 
-  cudaMalloc((void **)&d_gamma_grad, gamma_betta_size);
-  cudaMalloc((void **)&d_betta_grad, gamma_betta_size);
-  cudaMalloc((void **)&d_inp_grad, grad_output_size);
-  cudaMalloc((void **)&d_out_grad, grad_output_size);
-  cudaMalloc((void **)&d_inp, grad_output_size);
-  cudaMalloc((void **)&d_gamma, gamma_betta_size);
-  cudaMalloc((void **)&d_betta, gamma_betta_size);
-  cudaMalloc((void **)&d_vars, vars_means_size);
-  cudaMalloc((void **)&d_means, vars_means_size);
+  float *buf = nullptr;
+  size_t total_size = 3 * grad_output_size + 4 * gamma_betta_size + 2 * vars_means_size;
+  cudaMalloc((void **)&buf, total_size);
+  d_gamma_grad = buf;
+  d_betta_grad = d_gamma_grad + gamma_betta_size / sizeof(float);
+  d_inp_grad = d_betta_grad + gamma_betta_size / sizeof(float);
+  d_out_grad = d_inp_grad + grad_output_size / sizeof(float);
+  d_inp = d_out_grad + grad_output_size / sizeof(float);
+  d_gamma = d_inp + grad_output_size / sizeof(float);
+  d_betta = d_gamma + gamma_betta_size / sizeof(float);
+  d_vars = d_betta + gamma_betta_size / sizeof(float);
+  d_means = d_vars + vars_means_size / sizeof(float);
+
+
+  // cudaMalloc((void **)&d_gamma_grad, gamma_betta_size);
+  // cudaMalloc((void **)&d_betta_grad, gamma_betta_size);
+  // cudaMalloc((void **)&d_inp_grad, grad_output_size);
+  // cudaMalloc((void **)&d_out_grad, grad_output_size);
+  // cudaMalloc((void **)&d_inp, grad_output_size);
+  // cudaMalloc((void **)&d_gamma, gamma_betta_size);
+  // cudaMalloc((void **)&d_betta, gamma_betta_size);
+  // cudaMalloc((void **)&d_vars, vars_means_size);
+  // cudaMalloc((void **)&d_means, vars_means_size);
 
   // Copy memory to device
   cudaMemcpy((void *)d_out_grad, out_grad, grad_output_size, cudaMemcpyHostToDevice);
@@ -306,14 +430,15 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
   cudaMemcpy(inp_grad, d_inp_grad, grad_output_size, cudaMemcpyDeviceToHost);
 
   // Free device memory
-  cudaFree(d_gamma_grad);
-  cudaFree(d_betta_grad);
-  cudaFree(d_inp_grad);
-  cudaFree((void *)d_out_grad);
-  cudaFree((void *)d_inp);
-  cudaFree((void *)d_gamma);
-  cudaFree((void *)d_betta);
-  cudaFree((void *)d_vars);
-  cudaFree((void *)d_means);
+  cudaFree((void *)buf);
+//   cudaFree(d_gamma_grad);
+//   cudaFree(d_betta_grad);
+//   cudaFree(d_inp_grad);
+//   cudaFree((void *)d_out_grad);
+//   cudaFree((void *)d_inp);
+//   cudaFree((void *)d_gamma);
+//   cudaFree((void *)d_betta);
+//   cudaFree((void *)d_vars);
+//   cudaFree((void *)d_means);
 }}
 }}

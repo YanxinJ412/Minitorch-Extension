@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from .tensor import tensor, tensor_from_numpy
 from .module import Module, Parameter
@@ -43,9 +44,16 @@ class MultiHeadAttention(Module):
         self.n_head    = n_head
         self.causal    = causal
         self.attn_hidden_dim = n_embd // n_head
+        self.use_fused_kernel = use_fused_kernel
 
         # COPY FROM ASSIGN2_4
-        raise NotImplementedError
+        # raise NotImplementedError
+        self.bias = bias
+        self.q_projection = Linear(n_embd, n_embd, self.bias, backend)
+        self.k_projection = Linear(n_embd, n_embd, self.bias, backend)
+        self.v_projection = Linear(n_embd, n_embd, self.bias, backend)
+        self.out_projection = Linear(n_embd, n_embd, self.bias, backend)
+        self.dropout = Dropout(p_dropout)
 
     def create_causal_mask(self, bs, nh, seq_len):
         """
@@ -69,8 +77,11 @@ class MultiHeadAttention(Module):
         batch_size, seq_len, n_embd = x.shape
         
         # COPY FROM ASSIGN2_4
-        raise NotImplementedError
-        
+        # raise NotImplementedError
+        x_2d = x.view(batch_size * seq_len, n_embd)
+        q = self.q_projection(x_2d).view(batch_size, seq_len, self.n_head, self.attn_hidden_dim).permute(0, 2, 1, 3)
+        kT = self.k_projection(x_2d).view(batch_size, seq_len, self.n_head, self.attn_hidden_dim).permute(0, 2, 3, 1)
+        v = self.v_projection(x_2d).view(batch_size, seq_len, self.n_head, self.attn_hidden_dim).permute(0, 2, 1, 3)
         return q, kT, v
 
     def self_attention(self, q, kT, v):
@@ -96,10 +107,30 @@ class MultiHeadAttention(Module):
         
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
-            raise NotImplementedError
+            # raise NotImplementedError
+            attn = (q @ kT) / math.sqrt(q_dim)
+            if self.causal:
+                attn = attn + self.create_causal_mask(batch_size, num_head, queries_len)
+            attn = softmax(attn, dim=3)
+            attn = self.dropout(attn)
+            result = attn @ v
+            result = result.permute(0, 2, 1, 3).contiguous()
+            result_2d = result.view(batch_size * queries_len, self.n_embd)
+            result_2d = self.out_projection(result_2d)
+            result = result_2d.view(batch_size, queries_len, self.n_embd)
         else:
             # BEGIN ASSIGN3_3
-            raise NotImplementedError
+            # raise NotImplementedError
+            attn = (q @ kT) / math.sqrt(q_dim)
+            if self.causal:
+                attn = attn + self.create_causal_mask(batch_size, num_head, queries_len)
+            attn = attn.attn_softmax(attn)
+            attn = self.dropout(attn)
+            result = attn @ v
+            result = result.permute(0, 2, 1, 3).contiguous()
+            result_2d = result.view(batch_size * queries_len, self.n_embd)
+            result_2d = self.out_projection(result_2d)
+            result = result_2d.view(batch_size, queries_len, self.n_embd)
             # END ASSIGN3_3
 
         return result
@@ -115,7 +146,9 @@ class MultiHeadAttention(Module):
         """
         batch_size, seq_len, n_embd = x.shape
         # COPY FROM ASSIGN2_4
-        raise NotImplementedError
+        # raise NotImplementedError
+        q, kT, v = self.project_to_query_key_value(x)
+        return self.self_attention(q, kT, v)
 
 
 class FeedForward(Module):
@@ -135,7 +168,10 @@ class FeedForward(Module):
             dropout    : dropout layer
         """
         # COPY FROM ASSIGN2_4
-        raise NotImplementedError
+        # raise NotImplementedError
+        self.linear_in  = Linear(n_embd, middle_dim, bias=bias, backend=backend)
+        self.linear_out = Linear(middle_dim, n_embd, bias=bias, backend=backend)
+        self.dropout    = Dropout(p_dropout)
 
     def forward(self, x):
         """A FFN Module in a Pre-LN Transformer with GELU Activation and dropout.
@@ -149,7 +185,9 @@ class FeedForward(Module):
         batch_size, seq_len, n_embd = x.shape
 
         # COPY FROM ASSIGN2_4
-        raise NotImplementedError
+        # raise NotImplementedError
+        x = GELU(self.linear_in(x.view(batch_size * seq_len, n_embd)))
+        x = self.dropout(self.linear_out(x)).view(batch_size, seq_len, n_embd)
 
         return x
 
@@ -175,17 +213,23 @@ class TransformerLayer(Module):
         # COPY FROM ASSIGN2_4
         # self.attention
         # self.ff
-        raise NotImplementedError
+        # raise NotImplementedError
+        self.attention = MultiHeadAttention(n_embd, n_head, True, p_dropout, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.ff = FeedForward(n_embd, p_dropout=p_dropout, bias=bias, backend=backend)
 
         self.use_fused_kernel = use_fused_kernel
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             # self.ln_1
             # self.ln_2
-            raise NotImplementedError
+            self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend)
+            self.ln_2 = LayerNorm1d(n_embd, ln_eps, backend)
+            # raise NotImplementedError
         else:
             # BEGIN ASSIGN3_3
-            raise NotImplementedError
+            # raise NotImplementedError
+            self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend)
+            self.ln_2 = LayerNorm1d(n_embd, ln_eps, backend)
             # END ASSIGN3_3
 
     def forward(self, x):
@@ -198,13 +242,31 @@ class TransformerLayer(Module):
         
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
-            raise NotImplementedError
+            # raise NotImplementedError
+            x_2d = x.view(batch_size * seq_len, x_dim)
+            x_1norm = self.ln_1(x_2d).view(batch_size, seq_len, x_dim)
+            x_1attn = self.attention(x_1norm)
+            x_1sum = x_2d + x_1attn.view(batch_size * seq_len, x_dim)
+            x_2norm = self.ln_2(x_1sum).view(batch_size, seq_len, x_dim)
+            x_2ff = self.ff(x_2norm).view(batch_size * seq_len, x_dim)
+            x_2sum = x_1sum + x_2ff
+            x_out = x_2sum.view(batch_size, seq_len, x_dim)
         else:
             # BEGIN ASSIGN3_3
-            raise NotImplementedError
+            # raise NotImplementedError
+            x_2d = x.view(batch_size * seq_len, x_dim)
+            x_1norm_2d = x_2d.layernorm(self.ln_1.weights.value, self.ln_1.bias.value)
+            x_1norm = x_1norm_2d.view(batch_size, seq_len, x_dim)
+            x_1attn = self.attention(x_1norm)
+            x_1sum = x_2d + x_1attn.view(batch_size * seq_len, x_dim)
+            x_2norm_2d = x_1sum.layernorm(self.ln_2.weights.value, self.ln_2.bias.value)
+            x_2norm = x_2norm_2d.view(batch_size, seq_len, x_dim)
+            x_2ff = self.ff(x_2norm).view(batch_size * seq_len, x_dim)
+            x_2sum = x_1sum + x_2ff
+            x_out = x_2sum.view(batch_size, seq_len, x_dim)
             # END ASSIGN3_3
 
-        return x
+        return x_out
 
 
 class DecoderLM(Module):
@@ -256,16 +318,26 @@ class DecoderLM(Module):
         # self.t_layer_4           = 
         # self.dropout             = 
         # self.lm_head             = 
-        raise NotImplementedError
+        # raise NotImplementedError
+        self.token_embeddings = Embedding(n_vocab, n_embd, backend)
+        self.position_embeddings = Embedding(n_positions, n_embd, backend)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.dropout = Dropout(p_dropout)
+        self.lm_head = Linear(n_embd, n_vocab, bias, backend)
 
         self.use_fused_kernel = use_fused_kernel
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             # self.ln                  = 
-            raise NotImplementedError
+            # raise NotImplementedError
+            self.ln = LayerNorm1d(n_embd, ln_eps, backend)
         else:
             # BEGIN ASSIGN3_3
-            raise NotImplementedError
+            # raise NotImplementedError
+            self.ln = LayerNorm1d(n_embd, ln_eps, backend)
             # END ASSIGN3_3
         
     def forward(self, idx):
@@ -282,10 +354,34 @@ class DecoderLM(Module):
 
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
-            raise NotImplementedError
+            # raise NotImplementedError
+            taken_embd = self.token_embeddings(idx)
+            pos_embd = self.position_embeddings(pos).view(1, seq_len, self.n_embd)
+            x_embd = taken_embd + pos_embd
+            x_embd = self.dropout(x_embd)
+            x_embd = self.t_layer_1(x_embd)
+            x_embd = self.t_layer_2(x_embd)
+            x_embd = self.t_layer_3(x_embd)
+            x_embd = self.t_layer_4(x_embd)
+            x_embd = x_embd.view(batch_size * seq_len, self.n_embd)
+            x_embd = self.ln(x_embd)
+            x_embd = self.lm_head(x_embd)
+            x_embd = x_embd.view(batch_size, seq_len, self.n_vocab)
         else:
             # BEGIN ASSIGN3_3
-            raise NotImplementedError
+            # raise NotImplementedError
+            taken_embd = self.token_embeddings(idx)
+            pos_embd = self.position_embeddings(pos).view(1, seq_len, self.n_embd)
+            x_embd = taken_embd + pos_embd
+            x_embd = self.dropout(x_embd)
+            x_embd = self.t_layer_1(x_embd)
+            x_embd = self.t_layer_2(x_embd)
+            x_embd = self.t_layer_3(x_embd)
+            x_embd = self.t_layer_4(x_embd)
+            x_embd = x_embd.view(batch_size * seq_len, self.n_embd)
+            x_embd = x_embd.layernorm(self.ln.weights.value, self.ln.bias.value)
+            x_embd = self.lm_head(x_embd)
+            x_embd = x_embd.view(batch_size, seq_len, self.n_vocab)
             # END ASSIGN3_3
 
-        return x
+        return x_embd
