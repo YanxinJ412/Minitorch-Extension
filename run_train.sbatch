@@ -22,7 +22,7 @@ TRANSFORMERS_CACHE="$PWD/hf_cache/transformers" \
 python project/run_autoregressive_benchmark.py \
   --model_max_length=128 \
   --n_epochs=1 \
-  --use_fused_kernel=True \
+  --use_fused_kernel=False \
   --batch_size=16 \
   --save_weights_path=./workdir_autoregressive_128/model_weights.npz
 

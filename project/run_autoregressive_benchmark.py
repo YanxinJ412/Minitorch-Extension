@@ -220,22 +220,29 @@ def benchmark_autoregressive_generation(
     prompt_length: int = 1,
     num_new_tokens: int = 64,
     num_prompts: int = 20,
-    kv_cache_quantization: str = "none",
 ) -> Dict[str, object]:
     outputs = {}
     was_training = model.training
     model.eval()
 
     eval_blocks = [block for block in blocks if len(block) > prompt_length][:num_prompts]
+    baseline_generations = []
 
-    for use_cache in (False, True):
-        mode = "kv_cache" if use_cache else "full_recompute"
+    eval_modes = [
+        ("full_recompute", False, "none"),
+        ("kv_cache", True, "none"),
+        ("kv_cache_int8", True, "int8"),
+        ("kv_cache_int4", True, "int4"),
+    ]
+
+    for mode, use_cache, kv_cache_quantization in eval_modes:
         print(f"Starting evaluation for mode={mode} on {len(eval_blocks)} prompts")
         all_generations = []
         cache_sizes = []
         match_rates = []
+        mode_generations = []
 
-        for block in tqdm.tqdm(eval_blocks, desc=f"Evaluating ({mode})"):
+        for block_idx, block in enumerate(tqdm.tqdm(eval_blocks, desc=f"Evaluating ({mode})")):
             prompt_ids = block[:prompt_length]
             generation = greedy_decode_fixed_tokens(
                 model=model,
@@ -247,20 +254,15 @@ def benchmark_autoregressive_generation(
             )
             all_generations.append(generation["tokens_per_sec"])
             cache_sizes.append(generation["kv_cache_bytes"])
+            mode_generations.append(generation["generated_ids"])
 
             if use_cache:
-                baseline = greedy_decode_fixed_tokens(
-                    model=model,
-                    prompt_ids=prompt_ids,
-                    backend=backend,
-                    num_new_tokens=num_new_tokens,
-                    use_cache=False,
-                    kv_cache_quantization=kv_cache_quantization,
-                )
                 generated = np.array(generation["generated_ids"])
-                baseline_generated = np.array(baseline["generated_ids"])
+                baseline_generated = np.array(baseline_generations[block_idx])
                 if baseline_generated.size:
                     match_rates.append(float(np.mean(generated == baseline_generated)))
+        if not use_cache:
+            baseline_generations = mode_generations
 
         outputs[mode] = {
             "prompt_length": prompt_length,
@@ -272,10 +274,13 @@ def benchmark_autoregressive_generation(
         if use_cache and match_rates:
             outputs[mode]["avg_token_match_rate_vs_full"] = float(np.mean(match_rates))
 
-    if outputs.get("full_recompute") and outputs.get("kv_cache"):
+    if outputs.get("full_recompute"):
         base_tps = outputs["full_recompute"]["avg_tokens_per_sec"]
-        cache_tps = outputs["kv_cache"]["avg_tokens_per_sec"]
-        outputs["speedup"] = cache_tps / max(base_tps, 1e-8)
+        outputs["speedup"] = {
+            mode: outputs[mode]["avg_tokens_per_sec"] / max(base_tps, 1e-8)
+            for mode in ("kv_cache", "kv_cache_int8", "kv_cache_int4")
+            if mode in outputs
+        }
 
     if was_training:
         model.train()
@@ -303,7 +308,6 @@ def main(
     generation_examples=20,
     generation_prompt_length=1,
     generation_max_new_tokens=32,
-    kv_cache_quantization="none",
     max_train_texts=0,
     max_validation_texts=0,
     max_test_texts=0,
@@ -324,7 +328,6 @@ def main(
 
     backend = minitorch.TensorBackend(CudaKernelOps)
     print("use_fused_kernel: ", use_fused_kernel)
-    print("kv_cache_quantization: ", kv_cache_quantization)
 
     config = {
         "n_vocab": n_vocab,
@@ -410,7 +413,6 @@ def main(
             prompt_length=generation_prompt_length,
             num_new_tokens=generation_max_new_tokens,
             num_prompts=generation_examples,
-            kv_cache_quantization=kv_cache_quantization,
         )
 
 
