@@ -24,6 +24,22 @@ from project.checkpointing import (
 from project.generation import benchmark_generation
 
 
+def concat_translation_examples(examples, src_key, tgt_key, group_size):
+    if group_size <= 1:
+        return examples
+
+    grouped = []
+    for i in range(0, len(examples), group_size):
+        chunk = examples[i:i + group_size]
+        if len(chunk) < group_size:
+            break
+        grouped.append({
+            src_key: f" <eos_{src_key}> ".join(example[src_key] for example in chunk),
+            tgt_key: f" <eos_{tgt_key}> ".join(example[tgt_key] for example in chunk),
+        })
+    return grouped
+
+
 def get_dataset(dataset_name, model_max_length):
     """
     Obtain IWSLT (de-en) dataset.
@@ -256,18 +272,20 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          load_weights_path=None,
          save_weights_path=None,
          run_generation_eval=False,
+         eval_concat_group_size=1,
          generation_examples=5,
          generation_max_new_tokens=32):
     np.random.seed(seed)
     random.seed(seed)
 
     workdir = f'./workdir_vocab{n_vocab}_lr{learning_rate}_embd{n_embd}'
-    os.makedirs(workdir, exist_ok=True)
-    artifact_dir = workdir
-    if load_weights_path is not None:
-        candidate_dir = os.path.dirname(load_weights_path) or "."
-        if os.path.exists(candidate_dir):
-            artifact_dir = candidate_dir
+    if save_weights_path is not None:
+        artifact_dir = os.path.dirname(save_weights_path) or "."
+    elif load_weights_path is not None:
+        artifact_dir = os.path.dirname(load_weights_path) or "."
+    else:
+        artifact_dir = workdir
+    os.makedirs(artifact_dir, exist_ok=True)
 
     backend = minitorch.TensorBackend(CudaKernelOps)
     print("use_fused_kernel: ", use_fused_kernel)
@@ -297,6 +315,12 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
 
     dataset, src_key, tgt_key = get_dataset(
         dataset_name=dataset_name, model_max_length=model_max_length)
+    dataset['test'] = concat_translation_examples(
+        dataset['test'],
+        src_key=src_key,
+        tgt_key=tgt_key,
+        group_size=eval_concat_group_size,
+    )
 
     tokenizer = get_tokenizer(
         examples=dataset['train'],
@@ -327,6 +351,9 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
 
     if save_weights_path is None:
         save_weights_path = f"{artifact_dir}/model_weights.npz"
+    save_dir = os.path.dirname(save_weights_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     save_model_weights(model=model, path=save_weights_path)
     print(f"saved model weights to {save_weights_path}")
     save_model_config(config=config, path=f"{artifact_dir}/model_config.json")
