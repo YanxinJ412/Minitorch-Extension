@@ -16,4 +16,13 @@ source .venv/bin/activate
 export PYTHONPATH=$PWD
 
 echo "=== Fused run ==="
-python project/run_machine_translation.py   --model_max_length=256   --batch_size=16   --samples_per_epoch=4000   --n_epochs=1   --use_fused_kernel=True   --save_weights_path=./workdir_vocab10000_lr0.002_embd256_large/model_weights.npz
+HF_HOME="$PWD/hf_cache" \
+HF_DATASETS_CACHE="$PWD/hf_cache/datasets" \
+TRANSFORMERS_CACHE="$PWD/hf_cache/transformers" \
+python project/run_autoregressive_benchmark.py \
+  --model_max_length=128 \
+  --n_epochs=1 \
+  --use_fused_kernel=True \
+  --batch_size=16 \
+  --save_weights_path=./workdir_autoregressive_128/model_weights.npz
+

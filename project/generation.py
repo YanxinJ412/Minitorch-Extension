@@ -15,6 +15,9 @@ def build_translation_prompt(example, src_key, tokenizer) -> List[int]:
 def estimate_kv_cache_bytes(kv_cache) -> int:
     total = 0
     for layer_cache in kv_cache.layers:
+        if hasattr(layer_cache, "storage_nbytes"):
+            total += layer_cache.storage_nbytes
+            continue
         if layer_cache.key is not None:
             total += layer_cache.key._tensor._storage.nbytes
         if layer_cache.value is not None:
@@ -22,7 +25,16 @@ def estimate_kv_cache_bytes(kv_cache) -> int:
     return total
 
 
-def greedy_decode(model, prompt_ids, tokenizer, backend, max_new_tokens, eos_token_id, use_cache):
+def greedy_decode(
+    model,
+    prompt_ids,
+    tokenizer,
+    backend,
+    max_new_tokens,
+    eos_token_id,
+    use_cache,
+    kv_cache_quantization: str="none",
+):
     prompt_ids = list(prompt_ids)
     generated_ids: List[int] = []
     kv_cache = None
@@ -30,7 +42,11 @@ def greedy_decode(model, prompt_ids, tokenizer, backend, max_new_tokens, eos_tok
     start_time = time.time()
     if use_cache:
         prompt_tensor = minitorch.tensor([prompt_ids], backend=backend)
-        logits, kv_cache = model(prompt_tensor, use_cache=True)
+        logits, kv_cache = model(
+            prompt_tensor,
+            use_cache=True,
+            kv_cache_quantization=kv_cache_quantization,
+        )
         next_token = int(np.argmax(logits.to_numpy()[0, -1, :]))
     else:
         context_ids = list(prompt_ids)
@@ -73,6 +89,7 @@ def benchmark_generation(
     backend,
     max_new_tokens: int = 32,
     num_examples: int = 5,
+    kv_cache_quantization: str = "none",
 ) -> Dict[str, object]:
     bleu = BLEU()
     outputs = {}
@@ -99,6 +116,7 @@ def benchmark_generation(
                 max_new_tokens=max_new_tokens,
                 eos_token_id=eos_token_id,
                 use_cache=use_cache,
+                kv_cache_quantization=kv_cache_quantization,
             )
 
             prediction_text = generation["generated_text"].split(f"<eos_{tgt_key}>")[0]
@@ -119,6 +137,7 @@ def benchmark_generation(
             "bleu": bleu.corpus_score(predictions, [references]).score,
             "avg_tokens_per_sec": float(np.mean(tokens_per_sec)) if tokens_per_sec else 0.0,
             "avg_kv_cache_bytes": float(np.mean(cache_sizes)) if cache_sizes else 0.0,
+            "kv_cache_quantization": kv_cache_quantization if use_cache else "none",
             "samples": sample_outputs[: min(3, len(sample_outputs))],
         }
 

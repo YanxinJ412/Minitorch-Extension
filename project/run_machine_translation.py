@@ -274,7 +274,8 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          run_generation_eval=False,
          eval_concat_group_size=1,
          generation_examples=5,
-         generation_max_new_tokens=32):
+         generation_max_new_tokens=32,
+         kv_cache_quantization='none'):
     np.random.seed(seed)
     random.seed(seed)
 
@@ -289,6 +290,7 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
 
     backend = minitorch.TensorBackend(CudaKernelOps)
     print("use_fused_kernel: ", use_fused_kernel)
+    print("kv_cache_quantization: ", kv_cache_quantization)
 
     config = {
         'n_vocab'     : n_vocab,  # vocab_size
@@ -368,6 +370,7 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
             backend=backend,
             max_new_tokens=generation_max_new_tokens,
             num_examples=generation_examples,
+            kv_cache_quantization=kv_cache_quantization,
         )
 
 

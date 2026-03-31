@@ -372,7 +372,7 @@ class DecoderLM(Module):
     def init_kv_cache(self) -> KVCache:
         return KVCache(n_layers=self.n_layer, backend=self.backend)
 
-    def forward(self, idx, kv_cache: Optional[KVCache]=None, use_cache: bool=False):
+    def forward(self, idx, kv_cache: Optional[KVCache]=None, use_cache: bool=False, kv_cache_quantization=None):
         """A Forward pass of a Decoder-only Transformer Language model.
         Args: 
             idx: input of shape (batch_size, seq_len)
