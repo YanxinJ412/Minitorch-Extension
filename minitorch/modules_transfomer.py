@@ -124,7 +124,7 @@ class MultiHeadAttention(Module):
         kT = k.permute(0, 1, 3, 2)
         key_len = k.shape[2]
         
-        if not self.use_fused_kernel or use_cache:
+        if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             # raise NotImplementedError
             attn = (q @ kT) / math.sqrt(q_dim)
@@ -142,7 +142,7 @@ class MultiHeadAttention(Module):
             # raise NotImplementedError
             attn = (q @ kT) / math.sqrt(q_dim)
             if self.causal:
-                attn = attn + self.create_causal_mask(batch_size, num_head, queries_len)
+                attn = attn + self.create_causal_mask(batch_size, num_head, queries_len, key_len, past_len=past_len)
             attn = attn.attn_softmax(attn)
             attn = self.dropout(attn)
             result = attn @ v
@@ -369,10 +369,22 @@ class DecoderLM(Module):
             self.ln = LayerNorm1d(n_embd, ln_eps, backend)
             # END ASSIGN3_3
         
-    def init_kv_cache(self) -> KVCache:
-        return KVCache(n_layers=self.n_layer, backend=self.backend)
+    def init_kv_cache(self, quantization: Optional[str]=None, max_cache_bytes: Optional[int]=None) -> KVCache:
+        return KVCache(
+            n_layers=self.n_layer,
+            backend=self.backend,
+            quantization=quantization,
+            max_cache_bytes=max_cache_bytes,
+        )
 
-    def forward(self, idx, kv_cache: Optional[KVCache]=None, use_cache: bool=False, kv_cache_quantization=None):
+    def forward(
+        self,
+        idx,
+        kv_cache: Optional[KVCache]=None,
+        use_cache: bool=False,
+        kv_cache_quantization: Optional[str]=None,
+        kv_cache_max_bytes: Optional[int]=None,
+    ):
         """A Forward pass of a Decoder-only Transformer Language model.
         Args: 
             idx: input of shape (batch_size, seq_len)
@@ -383,7 +395,10 @@ class DecoderLM(Module):
         
         batch_size, seq_len = idx.shape
         if use_cache and kv_cache is None:
-            kv_cache = self.init_kv_cache()
+            kv_cache = self.init_kv_cache(
+                quantization=kv_cache_quantization,
+                max_cache_bytes=kv_cache_max_bytes,
+            )
 
         past_len = 0 if kv_cache is None else kv_cache.seq_len
         pos = tensor([i + past_len for i in range(seq_len)], backend=self.backend).view(1, seq_len)
@@ -419,5 +434,6 @@ class DecoderLM(Module):
             # END ASSIGN3_3
 
         if use_cache:
+            # kv_cache.enforce_budget()
             return x_embd, kv_cache
         return x_embd

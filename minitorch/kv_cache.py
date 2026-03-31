@@ -11,7 +11,7 @@ from .tensor_ops import TensorBackend
 
 
 _SUPPORTED_QUANTIZATION = {"none", "int8", "int4"}
-_DEFAULT_CACHE_BUDGET_BYTES = 2 * 1024 * 1024
+_DEFAULT_CACHE_BUDGET_BYTES = 0
 
 
 @dataclass
@@ -96,8 +96,8 @@ def _dequantize_array(storage: QuantizedTensorStorage) -> np.ndarray:
 class LayerKVCache:
     backend: TensorBackend
     quantization: str = "none"
-    _key_tensor: Optional[Tensor] = None
-    _value_tensor: Optional[Tensor] = None
+    _key_array: Optional[np.ndarray] = None
+    _value_array: Optional[np.ndarray] = None
     _key_quantized: Optional[QuantizedTensorStorage] = None
     _value_quantized: Optional[QuantizedTensorStorage] = None
 
@@ -105,43 +105,47 @@ class LayerKVCache:
         self.quantization = _validate_quantization(self.quantization)
 
     def _get_shape(self) -> Optional[Tuple[int, ...]]:
-        if self._key_tensor is not None:
-            return self._key_tensor.shape
+        if self._key_array is not None:
+            return self._key_array.shape
         if self._key_quantized is not None:
             return self._key_quantized.shape
         return None
 
-    def _tensor_to_numpy(self, tensor: Optional[Tensor], quantized: Optional[QuantizedTensorStorage]) -> Optional[np.ndarray]:
-        if tensor is not None:
-            return tensor.detach().to_numpy()
+    def _cached_to_numpy(
+        self,
+        array: Optional[np.ndarray],
+        quantized: Optional[QuantizedTensorStorage],
+    ) -> Optional[np.ndarray]:
+        if array is not None:
+            return array
         if quantized is not None:
             return _dequantize_array(quantized)
         return None
 
-    def _store_tensor(self, key_np: np.ndarray, value_np: np.ndarray) -> None:
+    def _store_array(self, key_np: np.ndarray, value_np: np.ndarray) -> None:
         key_np = key_np.astype(np.float32, copy=False)
         value_np = value_np.astype(np.float32, copy=False)
         if self.quantization == "none":
-            self._key_tensor = tensor_from_numpy(key_np, backend=self.backend)
-            self._value_tensor = tensor_from_numpy(value_np, backend=self.backend)
+            self._key_array = key_np
+            self._value_array = value_np
             self._key_quantized = None
             self._value_quantized = None
         else:
             self._key_quantized = _quantize_array(key_np, self.quantization)
             self._value_quantized = _quantize_array(value_np, self.quantization)
-            self._key_tensor = None
-            self._value_tensor = None
+            self._key_array = None
+            self._value_array = None
 
     @property
     def key(self) -> Optional[Tensor]:
-        key_np = self._tensor_to_numpy(self._key_tensor, self._key_quantized)
+        key_np = self._cached_to_numpy(self._key_array, self._key_quantized)
         if key_np is None:
             return None
         return tensor_from_numpy(key_np, backend=self.backend)
 
     @property
     def value(self) -> Optional[Tensor]:
-        value_np = self._tensor_to_numpy(self._value_tensor, self._value_quantized)
+        value_np = self._cached_to_numpy(self._value_array, self._value_quantized)
         if value_np is None:
             return None
         return tensor_from_numpy(value_np, backend=self.backend)
@@ -156,15 +160,15 @@ class LayerKVCache:
     def append(self, key: Tensor, value: Tensor) -> None:
         key_np = key.detach().to_numpy()
         value_np = value.detach().to_numpy()
-        cached_key = self._tensor_to_numpy(self._key_tensor, self._key_quantized)
-        cached_value = self._tensor_to_numpy(self._value_tensor, self._value_quantized)
+        cached_key = self._cached_to_numpy(self._key_array, self._key_quantized)
+        cached_value = self._cached_to_numpy(self._value_array, self._value_quantized)
         if cached_key is None:
             merged_key = key_np
             merged_value = value_np
         else:
             merged_key = np.concatenate((cached_key, key_np), axis=2)
             merged_value = np.concatenate((cached_value, value_np), axis=2)
-        self._store_tensor(merged_key, merged_value)
+        self._store_array(merged_key, merged_value)
 
     def trim_left(self, n_tokens: int) -> None:
         if n_tokens <= 0 or self.seq_len == 0:
@@ -174,28 +178,28 @@ class LayerKVCache:
             self.clear()
             return
 
-        cached_key = self._tensor_to_numpy(self._key_tensor, self._key_quantized)
-        cached_value = self._tensor_to_numpy(self._value_tensor, self._value_quantized)
+        cached_key = self._cached_to_numpy(self._key_array, self._key_quantized)
+        cached_value = self._cached_to_numpy(self._value_array, self._value_quantized)
         assert cached_key is not None
         assert cached_value is not None
-        self._store_tensor(cached_key[:, :, n_tokens:, :], cached_value[:, :, n_tokens:, :])
+        self._store_array(cached_key[:, :, n_tokens:, :], cached_value[:, :, n_tokens:, :])
 
     def clear(self) -> None:
-        self._key_tensor = None
-        self._value_tensor = None
+        self._key_array = None
+        self._value_array = None
         self._key_quantized = None
         self._value_quantized = None
 
     @property
     def storage_nbytes(self) -> int:
         total = 0
-        if self._key_tensor is not None:
-            total += self._key_tensor._tensor._storage.nbytes
+        if self._key_array is not None:
+            total += self._key_array.nbytes
         elif self._key_quantized is not None:
             total += self._key_quantized.nbytes
 
-        if self._value_tensor is not None:
-            total += self._value_tensor._tensor._storage.nbytes
+        if self._value_array is not None:
+            total += self._value_array.nbytes
         elif self._value_quantized is not None:
             total += self._value_quantized.nbytes
         return total

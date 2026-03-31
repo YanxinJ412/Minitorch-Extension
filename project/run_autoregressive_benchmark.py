@@ -229,11 +229,13 @@ def benchmark_autoregressive_generation(
     eval_blocks = [block for block in blocks if len(block) > prompt_length][:num_prompts]
 
     for use_cache in (False, True):
+        mode = "kv_cache" if use_cache else "full_recompute"
+        print(f"Starting evaluation for mode={mode} on {len(eval_blocks)} prompts")
         all_generations = []
         cache_sizes = []
         match_rates = []
 
-        for block in eval_blocks:
+        for block in tqdm.tqdm(eval_blocks, desc=f"Evaluating ({mode})"):
             prompt_ids = block[:prompt_length]
             generation = greedy_decode_fixed_tokens(
                 model=model,
@@ -260,7 +262,6 @@ def benchmark_autoregressive_generation(
                 if baseline_generated.size:
                     match_rates.append(float(np.mean(generated == baseline_generated)))
 
-        mode = "kv_cache" if use_cache else "full_recompute"
         outputs[mode] = {
             "prompt_length": prompt_length,
             "generated_tokens": num_new_tokens,
@@ -287,11 +288,11 @@ def main(
     dataset_name="wikitext",
     dataset_config="wikitext-2-raw-v1",
     text_key="text",
-    model_max_length=128,
+    model_max_length=256,
     n_epochs=1,
-    batch_size=16,
+    batch_size=64,
     learning_rate=0.002,
-    samples_per_epoch=10000,
+    samples_per_epoch=20000,
     n_vocab=10000,
     n_embd=256,
     seed=11111,
@@ -301,7 +302,7 @@ def main(
     run_generation_eval=True,
     generation_examples=20,
     generation_prompt_length=1,
-    generation_max_new_tokens=128,
+    generation_max_new_tokens=32,
     kv_cache_quantization="none",
     max_train_texts=0,
     max_validation_texts=0,
