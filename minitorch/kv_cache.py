@@ -11,7 +11,7 @@ from .tensor_ops import TensorBackend
 
 
 _SUPPORTED_QUANTIZATION = {"none", "int8", "int4"}
-_DEFAULT_CACHE_BUDGET_BYTES = 64 * 1024
+_DEFAULT_CACHE_BUDGET_BYTES = -1 
 
 
 @dataclass

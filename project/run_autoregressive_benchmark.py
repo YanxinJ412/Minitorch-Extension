@@ -167,15 +167,29 @@ def model_forward_with_optional_cache_args(model, idx, use_cache=False, kv_cache
     signature = inspect.signature(model.forward)
     if "kv_cache_quantization" in signature.parameters:
         kwargs["kv_cache_quantization"] = kv_cache_quantization
+    if "kv_cache_max_bytes" in signature.parameters:
+        kwargs["kv_cache_max_bytes"] = model_forward_with_optional_cache_args.kv_cache_max_bytes
     return model(idx, **kwargs)
 
 
-def greedy_decode_fixed_tokens(model, prompt_ids, backend, num_new_tokens, use_cache, kv_cache_quantization):
+model_forward_with_optional_cache_args.kv_cache_max_bytes = None
+
+
+def greedy_decode_fixed_tokens(
+    model,
+    prompt_ids,
+    backend,
+    num_new_tokens,
+    use_cache,
+    kv_cache_quantization,
+    kv_cache_max_bytes,
+):
     prompt_ids = list(prompt_ids)
     generated_ids: List[int] = []
     kv_cache = None
 
     start_time = time.time()
+    model_forward_with_optional_cache_args.kv_cache_max_bytes = kv_cache_max_bytes
     if use_cache:
         logits, kv_cache = model_forward_with_optional_cache_args(
             model,
@@ -221,6 +235,7 @@ def benchmark_autoregressive_generation(
     num_new_tokens: int = 64,
     num_prompts: int = 20,
 ) -> Dict[str, object]:
+    constrained_cache_bytes = 128 * 1024
     outputs = {}
     was_training = model.training
     model.eval()
@@ -229,13 +244,16 @@ def benchmark_autoregressive_generation(
     baseline_generations = []
 
     eval_modes = [
-        ("full_recompute", False, "none"),
-        ("kv_cache", True, "none"),
-        ("kv_cache_int8", True, "int8"),
-        ("kv_cache_int4", True, "int4"),
+        ("full_recompute", False, "none", None),
+        ("kv_cache", True, "none", 0),
+        ("kv_cache_int8", True, "int8", 0),
+        ("kv_cache_int4", True, "int4", 0),
+        ("kv_cache_budget", True, "none", constrained_cache_bytes),
+        ("kv_cache_int8_budget", True, "int8", constrained_cache_bytes),
+        ("kv_cache_int4_budget", True, "int4", constrained_cache_bytes),
     ]
 
-    for mode, use_cache, kv_cache_quantization in eval_modes:
+    for mode, use_cache, kv_cache_quantization, kv_cache_max_bytes in eval_modes:
         print(f"Starting evaluation for mode={mode} on {len(eval_blocks)} prompts")
         all_generations = []
         cache_sizes = []
@@ -251,6 +269,7 @@ def benchmark_autoregressive_generation(
                 num_new_tokens=num_new_tokens,
                 use_cache=use_cache,
                 kv_cache_quantization=kv_cache_quantization,
+                kv_cache_max_bytes=kv_cache_max_bytes,
             )
             all_generations.append(generation["tokens_per_sec"])
             cache_sizes.append(generation["kv_cache_bytes"])
@@ -270,6 +289,7 @@ def benchmark_autoregressive_generation(
             "avg_tokens_per_sec": float(np.mean(all_generations)) if all_generations else 0.0,
             "avg_kv_cache_bytes": float(np.mean(cache_sizes)) if cache_sizes else 0.0,
             "kv_cache_quantization": kv_cache_quantization if use_cache else "none",
+            "kv_cache_max_bytes": kv_cache_max_bytes if use_cache else None,
         }
         if use_cache and match_rates:
             outputs[mode]["avg_token_match_rate_vs_full"] = float(np.mean(match_rates))
@@ -278,7 +298,14 @@ def benchmark_autoregressive_generation(
         base_tps = outputs["full_recompute"]["avg_tokens_per_sec"]
         outputs["speedup"] = {
             mode: outputs[mode]["avg_tokens_per_sec"] / max(base_tps, 1e-8)
-            for mode in ("kv_cache", "kv_cache_int8", "kv_cache_int4")
+            for mode in (
+                "kv_cache",
+                "kv_cache_int8",
+                "kv_cache_int4",
+                "kv_cache_budget",
+                "kv_cache_int8_budget",
+                "kv_cache_int4_budget",
+            )
             if mode in outputs
         }
 
