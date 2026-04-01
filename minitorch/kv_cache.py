@@ -11,7 +11,7 @@ from .tensor_ops import TensorBackend
 
 
 _SUPPORTED_QUANTIZATION = {"none", "int8", "int4"}
-_DEFAULT_CACHE_BUDGET_BYTES = 0
+_DEFAULT_CACHE_BUDGET_BYTES = 128 * 1024
 
 
 @dataclass
@@ -206,9 +206,16 @@ class LayerKVCache:
 
 
 class KVCache:
-    def __init__(self, n_layers: int, backend: TensorBackend, quantization: Optional[str]=None, max_cache_bytes: Optional[int]=None):
+    def __init__(
+        self,
+        n_layers: int,
+        backend: TensorBackend,
+        quantization: Optional[str]=None,
+        max_cache_bytes: Optional[int]=None,
+    ):
         self.quantization = _validate_quantization(quantization)
         self.max_cache_bytes = _DEFAULT_CACHE_BUDGET_BYTES if max_cache_bytes is None else max_cache_bytes
+        self.tokens_seen = 0
         self.layers: List[LayerKVCache] = [
             LayerKVCache(backend=backend, quantization=self.quantization) for _ in range(n_layers)
         ]
@@ -219,6 +226,7 @@ class KVCache:
     def clear(self) -> None:
         for layer in self.layers:
             layer.clear()
+        self.tokens_seen = 0
 
     @property
     def storage_nbytes(self) -> int:
@@ -235,6 +243,9 @@ class KVCache:
         if seq_len <= 0:
             return 0
         return max(1, int(np.ceil(self.storage_nbytes / seq_len)))
+
+    def record_tokens(self, n_tokens: int) -> None:
+        self.tokens_seen += int(n_tokens)
 
     def enforce_budget(self) -> None:
         if self.max_cache_bytes is None or self.max_cache_bytes <= 0:

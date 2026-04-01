@@ -26,3 +26,4 @@ python project/run_autoregressive_benchmark.py \
   --batch_size=16 \
   --save_weights_path=./workdir_autoregressive_128/model_weights.npz
 
+# python project/run_autoregressive_benchmark.py   --model_max_length=128   --use_fused_kernel=False   --n_epochs=0   --load_weights_path=./workdir_autoregressive_128/model_weights.npz   --generation_max_new_tokens=120 --generation_examples=2

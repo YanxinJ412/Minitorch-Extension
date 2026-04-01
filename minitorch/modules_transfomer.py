@@ -369,7 +369,11 @@ class DecoderLM(Module):
             self.ln = LayerNorm1d(n_embd, ln_eps, backend)
             # END ASSIGN3_3
         
-    def init_kv_cache(self, quantization: Optional[str]=None, max_cache_bytes: Optional[int]=None) -> KVCache:
+    def init_kv_cache(
+        self,
+        quantization: Optional[str]=None,
+        max_cache_bytes: Optional[int]=None,
+    ) -> KVCache:
         return KVCache(
             n_layers=self.n_layer,
             backend=self.backend,
@@ -400,7 +404,7 @@ class DecoderLM(Module):
                 max_cache_bytes=kv_cache_max_bytes,
             )
 
-        past_len = 0 if kv_cache is None else kv_cache.seq_len
+        past_len = 0 if kv_cache is None else kv_cache.tokens_seen
         pos = tensor([i + past_len for i in range(seq_len)], backend=self.backend).view(1, seq_len)
 
         if not self.use_fused_kernel:
@@ -434,6 +438,7 @@ class DecoderLM(Module):
             # END ASSIGN3_3
 
         if use_cache:
-            # kv_cache.enforce_budget()
+            kv_cache.record_tokens(seq_len)
+            kv_cache.enforce_budget()
             return x_embd, kv_cache
         return x_embd
