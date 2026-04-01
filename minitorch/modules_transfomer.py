@@ -56,18 +56,32 @@ class MultiHeadAttention(Module):
         self.out_projection = Linear(n_embd, n_embd, self.bias, backend)
         self.dropout = Dropout(p_dropout)
 
-    def create_causal_mask(self, bs, nh, query_len, key_len=None, past_len: int=0):
+    def create_causal_mask(
+        self,
+        bs,
+        nh,
+        query_len,
+        key_len=None,
+        past_len: int=0,
+        query_positions=None,
+        key_positions=None,
+    ):
         """
         Return a causal mask for attention scores of shape (bs, nh, query_len, key_len).
         """
-        if key_len is None:
-            key_len = query_len
-
-        query_positions = past_len + np.arange(query_len, dtype=np.int32)
-        key_positions = np.arange(key_len, dtype=np.int32)
+        if query_positions is None:
+            query_positions = past_len + np.arange(query_len, dtype=np.int64)
+        else:
+            query_positions = np.asarray(query_positions, dtype=np.int64)
+        if key_positions is None:
+            if key_len is None:
+                key_len = query_len
+            key_positions = np.arange(key_len, dtype=np.int64)
+        else:
+            key_positions = np.asarray(key_positions, dtype=np.int64)
         invalid = key_positions[None, :] > query_positions[:, None]
         mask = -np.finfo(datatype).max * invalid.astype(datatype)
-        mask = np.broadcast_to(mask, (bs, nh, query_len, key_len)).copy()
+        mask = np.broadcast_to(mask, (bs, nh, query_positions.shape[0], key_positions.shape[0])).copy()
         return tensor_from_numpy(mask, backend=self.backend)
 
     def project_to_query_key_value(self, x):
@@ -91,7 +105,15 @@ class MultiHeadAttention(Module):
         v = self.v_projection(x_2d).view(batch_size, seq_len, self.n_head, self.attn_hidden_dim).permute(0, 2, 1, 3)
         return q, k, v
 
-    def self_attention(self, q, k, v, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False):
+    def self_attention(
+        self,
+        q,
+        k,
+        v,
+        layer_cache: Optional[LayerKVCache]=None,
+        use_cache: bool=False,
+        query_positions=None,
+    ):
         """Given q, kT, and v of sizes defined above, return the result of MultiHeadAttention as described in the writeup
         softmax((q @ kT) / sqrt(attn_hidden_dim)) @ V.
         NOTE: We have added support for Batch Matrix Multiplication with 4 dimensions.
@@ -112,14 +134,20 @@ class MultiHeadAttention(Module):
         assert q_dim == k_dim == v_dim
         result = None
         past_len = 0
+        key_positions = None
+        if query_positions is not None:
+            query_positions = np.asarray(query_positions, dtype=np.int64)
 
         if use_cache:
             if layer_cache is None:
                 raise ValueError("use_cache=True requires a layer cache")
             past_len = layer_cache.seq_len
-            layer_cache.append(k, v)
+            if query_positions is None:
+                query_positions = np.arange(past_len, past_len + queries_len, dtype=np.int64)
+            layer_cache.append(k, v, query_positions)
             k = layer_cache.key
             v = layer_cache.value
+            key_positions = layer_cache.positions
 
         kT = k.permute(0, 1, 3, 2)
         key_len = k.shape[2]
@@ -129,7 +157,15 @@ class MultiHeadAttention(Module):
             # raise NotImplementedError
             attn = (q @ kT) / math.sqrt(q_dim)
             if self.causal:
-                attn = attn + self.create_causal_mask(batch_size, num_head, queries_len, key_len, past_len=past_len)
+                attn = attn + self.create_causal_mask(
+                    batch_size,
+                    num_head,
+                    queries_len,
+                    key_len,
+                    past_len=past_len,
+                    query_positions=query_positions,
+                    key_positions=key_positions,
+                )
             attn = softmax(attn, dim=3)
             attn = self.dropout(attn)
             result = attn @ v
@@ -142,7 +178,15 @@ class MultiHeadAttention(Module):
             # raise NotImplementedError
             attn = (q @ kT) / math.sqrt(q_dim)
             if self.causal:
-                attn = attn + self.create_causal_mask(batch_size, num_head, queries_len, key_len, past_len=past_len)
+                attn = attn + self.create_causal_mask(
+                    batch_size,
+                    num_head,
+                    queries_len,
+                    key_len,
+                    past_len=past_len,
+                    query_positions=query_positions,
+                    key_positions=key_positions,
+                )
             attn = attn.attn_softmax(attn)
             attn = self.dropout(attn)
             result = attn @ v
@@ -154,7 +198,7 @@ class MultiHeadAttention(Module):
 
         return result
 
-    def forward(self, x, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False):
+    def forward(self, x, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False, query_positions=None):
         """Computes MultiHeadAttention with causal masking if needed. 
 
         Args:
@@ -167,7 +211,14 @@ class MultiHeadAttention(Module):
         # COPY FROM ASSIGN2_4
         # raise NotImplementedError
         q, k, v = self.project_to_query_key_value(x)
-        return self.self_attention(q, k, v, layer_cache=layer_cache, use_cache=use_cache)
+        return self.self_attention(
+            q,
+            k,
+            v,
+            layer_cache=layer_cache,
+            use_cache=use_cache,
+            query_positions=query_positions,
+        )
 
 
 class FeedForward(Module):
@@ -251,7 +302,7 @@ class TransformerLayer(Module):
             self.ln_2 = LayerNorm1d(n_embd, ln_eps, backend)
             # END ASSIGN3_3
 
-    def forward(self, x, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False):
+    def forward(self, x, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False, query_positions=None):
         """
         The forward function of a Transformer Layer for a PRENORM Transformer.
         Input: the hidden states from previous layers `x` with shape (batch_size, seq_len, x_dim)
@@ -264,7 +315,12 @@ class TransformerLayer(Module):
             # raise NotImplementedError
             x_2d = x.view(batch_size * seq_len, x_dim)
             x_1norm = self.ln_1(x_2d).view(batch_size, seq_len, x_dim)
-            x_1attn = self.attention(x_1norm, layer_cache=layer_cache, use_cache=use_cache)
+            x_1attn = self.attention(
+                x_1norm,
+                layer_cache=layer_cache,
+                use_cache=use_cache,
+                query_positions=query_positions,
+            )
             x_1sum = x_2d + x_1attn.view(batch_size * seq_len, x_dim)
             x_2norm = self.ln_2(x_1sum).view(batch_size, seq_len, x_dim)
             x_2ff = self.ff(x_2norm).view(batch_size * seq_len, x_dim)
@@ -276,7 +332,12 @@ class TransformerLayer(Module):
             x_2d = x.view(batch_size * seq_len, x_dim)
             x_1norm_2d = x_2d.layernorm(self.ln_1.weights.value, self.ln_1.bias.value)
             x_1norm = x_1norm_2d.view(batch_size, seq_len, x_dim)
-            x_1attn = self.attention(x_1norm, layer_cache=layer_cache, use_cache=use_cache)
+            x_1attn = self.attention(
+                x_1norm,
+                layer_cache=layer_cache,
+                use_cache=use_cache,
+                query_positions=query_positions,
+            )
             x_1sum = x_2d + x_1attn.view(batch_size * seq_len, x_dim)
             x_2norm_2d = x_1sum.layernorm(self.ln_2.weights.value, self.ln_2.bias.value)
             x_2norm = x_2norm_2d.view(batch_size, seq_len, x_dim)
@@ -405,7 +466,8 @@ class DecoderLM(Module):
             )
 
         past_len = 0 if kv_cache is None else kv_cache.tokens_seen
-        pos = tensor([i + past_len for i in range(seq_len)], backend=self.backend).view(1, seq_len)
+        token_positions = np.arange(past_len, past_len + seq_len, dtype=np.int64)
+        pos = tensor(token_positions.tolist(), backend=self.backend).view(1, seq_len)
 
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
@@ -416,7 +478,12 @@ class DecoderLM(Module):
             x_embd = self.dropout(x_embd)
             for layer_idx, layer in enumerate(self.layers):
                 layer_cache = None if kv_cache is None else kv_cache[layer_idx]
-                x_embd = layer(x_embd, layer_cache=layer_cache, use_cache=use_cache)
+                x_embd = layer(
+                    x_embd,
+                    layer_cache=layer_cache,
+                    use_cache=use_cache,
+                    query_positions=token_positions,
+                )
             x_embd = x_embd.view(batch_size * seq_len, self.n_embd)
             x_embd = self.ln(x_embd)
             x_embd = self.lm_head(x_embd)
@@ -430,7 +497,12 @@ class DecoderLM(Module):
             x_embd = self.dropout(x_embd)
             for layer_idx, layer in enumerate(self.layers):
                 layer_cache = None if kv_cache is None else kv_cache[layer_idx]
-                x_embd = layer(x_embd, layer_cache=layer_cache, use_cache=use_cache)
+                x_embd = layer(
+                    x_embd,
+                    layer_cache=layer_cache,
+                    use_cache=use_cache,
+                    query_positions=token_positions,
+                )
             x_embd = x_embd.view(batch_size * seq_len, self.n_embd)
             x_embd = x_embd.layernorm(self.ln.weights.value, self.ln.bias.value)
             x_embd = self.lm_head(x_embd)

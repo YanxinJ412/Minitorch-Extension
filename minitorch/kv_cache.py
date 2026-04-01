@@ -11,7 +11,7 @@ from .tensor_ops import TensorBackend
 
 
 _SUPPORTED_QUANTIZATION = {"none", "int8", "int4"}
-_DEFAULT_CACHE_BUDGET_BYTES = 128 * 1024
+_DEFAULT_CACHE_BUDGET_BYTES = 64 * 1024
 
 
 @dataclass
@@ -100,6 +100,7 @@ class LayerKVCache:
     _value_array: Optional[np.ndarray] = None
     _key_quantized: Optional[QuantizedTensorStorage] = None
     _value_quantized: Optional[QuantizedTensorStorage] = None
+    _positions: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.quantization = _validate_quantization(self.quantization)
@@ -137,6 +138,10 @@ class LayerKVCache:
             self._value_array = None
 
     @property
+    def positions(self) -> Optional[np.ndarray]:
+        return self._positions
+
+    @property
     def key(self) -> Optional[Tensor]:
         key_np = self._cached_to_numpy(self._key_array, self._key_quantized)
         if key_np is None:
@@ -157,18 +162,27 @@ class LayerKVCache:
             return 0
         return shape[2]
 
-    def append(self, key: Tensor, value: Tensor) -> None:
+    def append(self, key: Tensor, value: Tensor, positions: np.ndarray) -> None:
         key_np = key.detach().to_numpy()
         value_np = value.detach().to_numpy()
+        positions = np.asarray(positions, dtype=np.int64)
+        if positions.ndim != 1:
+            raise ValueError("positions must be a 1D array")
+        if positions.shape[0] != key_np.shape[2]:
+            raise ValueError("positions length must match appended sequence length")
         cached_key = self._cached_to_numpy(self._key_array, self._key_quantized)
         cached_value = self._cached_to_numpy(self._value_array, self._value_quantized)
         if cached_key is None:
             merged_key = key_np
             merged_value = value_np
+            merged_positions = positions
         else:
             merged_key = np.concatenate((cached_key, key_np), axis=2)
             merged_value = np.concatenate((cached_value, value_np), axis=2)
+            assert self._positions is not None
+            merged_positions = np.concatenate((self._positions, positions), axis=0)
         self._store_array(merged_key, merged_value)
+        self._positions = merged_positions
 
     def trim_left(self, n_tokens: int) -> None:
         if n_tokens <= 0 or self.seq_len == 0:
@@ -183,12 +197,15 @@ class LayerKVCache:
         assert cached_key is not None
         assert cached_value is not None
         self._store_array(cached_key[:, :, n_tokens:, :], cached_value[:, :, n_tokens:, :])
+        assert self._positions is not None
+        self._positions = self._positions[n_tokens:]
 
     def clear(self) -> None:
         self._key_array = None
         self._value_array = None
         self._key_quantized = None
         self._value_quantized = None
+        self._positions = None
 
     @property
     def storage_nbytes(self) -> int:
@@ -202,6 +219,8 @@ class LayerKVCache:
             total += self._value_array.nbytes
         elif self._value_quantized is not None:
             total += self._value_quantized.nbytes
+        if self._positions is not None:
+            total += self._positions.nbytes
         return total
 
 
