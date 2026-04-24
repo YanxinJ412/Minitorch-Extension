@@ -3,8 +3,9 @@ import inspect
 import json
 import os
 import random
+import re
 import time
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import datasets
 import fire
@@ -156,7 +157,6 @@ def estimate_kv_cache_bytes(kv_cache) -> int:
             total += layer_cache.storage_nbytes
     return total
 
-
 def model_forward_with_optional_cache_args(model, idx, use_cache=False, kv_cache=None, kv_cache_quantization="none"):
     kwargs = {}
     if use_cache:
@@ -173,6 +173,49 @@ def model_forward_with_optional_cache_args(model, idx, use_cache=False, kv_cache
 
 
 model_forward_with_optional_cache_args.kv_cache_max_bytes = None
+
+
+def _build_generation_speed_curve(
+    chunk_elapsed: List[float],
+    chunk_n_tokens: List[int],
+    chunk_size: int,
+) -> Dict[str, object]:
+    cum = 0
+    ends: List[int] = []
+    for dt, nt in zip(chunk_elapsed, chunk_n_tokens):
+        cum += int(nt)
+        ends.append(cum)
+    return {
+        "chunk_size_tokens": int(chunk_size),
+        "chunk_end_token_index": ends,
+        "elapsed_sec_per_chunk": [float(x) for x in chunk_elapsed],
+    }
+
+
+def _aggregate_generation_speed_curves(
+    curves: Sequence[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    if not curves:
+        return None
+    first = curves[0]
+    n = len(first["elapsed_sec_per_chunk"])  # type: ignore[arg-type]
+    if n == 0:
+        return None
+    for c in curves:
+        if len(c["elapsed_sec_per_chunk"]) != n:  # type: ignore[arg-type]
+            return None
+    out: Dict[str, object] = {
+        "chunk_size_tokens": first["chunk_size_tokens"],
+        "chunk_end_token_index": list(first["chunk_end_token_index"]),
+        "n_prompts_averaged": len(curves),
+    }
+    stacks = np.array(
+        [[float(x) for x in c["elapsed_sec_per_chunk"]] for c in curves],
+        dtype=np.float64,
+    )
+    out["avg_elapsed_sec_per_chunk"] = stacks.mean(axis=0).tolist()
+    out["std_elapsed_sec_per_chunk"] = stacks.std(axis=0).tolist()
+    return out
 
 
 def greedy_decode_fixed_tokens(
@@ -203,7 +246,15 @@ def greedy_decode_fixed_tokens(
 
     next_token = int(np.argmax(logits.to_numpy()[0, -1, :]))
 
-    for _ in range(num_new_tokens):
+    chunk_elapsed: List[float] = []
+    chunk_n_tokens: List[int] = []
+    cs = 10
+    chunk_start: Optional[float] = None
+    n_in_chunk = 0
+
+    for step_i in range(num_new_tokens):
+        if n_in_chunk == 0:
+            chunk_start = time.perf_counter()
         generated_ids.append(next_token)
         if use_cache:
             logits, kv_cache = model_forward_with_optional_cache_args(
@@ -218,102 +269,237 @@ def greedy_decode_fixed_tokens(
             logits = model(minitorch.tensor([context_ids], backend=backend))
         next_token = int(np.argmax(logits.to_numpy()[0, -1, :]))
 
+        assert chunk_start is not None
+        n_in_chunk += 1
+        # Only record FULL chunks so each entry is "time per cs tokens".
+        if n_in_chunk == 10:
+            dt = time.perf_counter() - chunk_start
+            chunk_elapsed.append(dt)
+            chunk_n_tokens.append(n_in_chunk)
+            n_in_chunk = 0
+            chunk_start = None
+
     elapsed = time.time() - start_time
+    speed_curve = _build_generation_speed_curve(chunk_elapsed, chunk_n_tokens, 10)
     return {
         "generated_ids": generated_ids,
         "elapsed_sec": elapsed,
         "tokens_per_sec": len(generated_ids) / max(elapsed, 1e-8),
         "kv_cache_bytes": 0 if kv_cache is None else estimate_kv_cache_bytes(kv_cache),
+        "generation_speed_curve": speed_curve,
     }
 
 
+def _mean_token_match_vs_reference(
+    generations: Sequence[Sequence[int]],
+    reference: Sequence[Sequence[int]],
+) -> float:
+    if not generations or not reference or len(generations) != len(reference):
+        return 0.0
+    rates: List[float] = []
+    for gen, ref in zip(generations, reference):
+        g = np.asarray(gen, dtype=np.int64)
+        r = np.asarray(ref, dtype=np.int64)
+        n = int(min(g.size, r.size))
+        if n <= 0:
+            continue
+        rates.append(float(np.mean(g[:n] == r[:n])))
+    return float(np.mean(rates)) if rates else 0.0
+
+
+def _first_divergence_index(a: Sequence[int], b: Sequence[int]) -> int:
+    """First index i where a[i] != b[i]. If identical up to min length, returns min length."""
+    n = int(min(len(a), len(b)))
+    for i in range(n):
+        if int(a[i]) != int(b[i]):
+            return i
+    return n
+
+
 def benchmark_autoregressive_generation(
-    model,
-    blocks: Sequence[List[int]],
+    *,
+    load_weights_path: str,
+    eval_blocks: Sequence[List[int]],
     backend,
-    prompt_length: int = 1,
-    num_new_tokens: int = 64,
-    num_prompts: int = 20,
+    n_vocab: int,
+    n_embd: int,
+    n_head: int,
+    n_positions: int,
+    n_layer: int,
+    p_dropout: float,
+    ln_eps: float,
+    prompt_length: int,
+    num_new_tokens: int,
+    num_prompts: int,
+    suite_kv_budget_bytes: int = 128 * 1024,
+    debug_compare_run_id: int = 0,
+    debug_print_first_n_tokens: int = 80,
+    suite_run_ids: str = "",
 ) -> Dict[str, object]:
-    constrained_cache_bytes = 128 * 1024
-    outputs = {}
-    was_training = model.training
-    model.eval()
-
-    eval_blocks = [block for block in blocks if len(block) > prompt_length][:num_prompts]
-    baseline_generations = []
-
-    eval_modes = [
-        ("full_recompute", False, "none", None),
-        ("kv_cache", True, "none", 0),
-        ("kv_cache_int8", True, "int8", 0),
-        ("kv_cache_int4", True, "int4", 0),
-        ("kv_cache_budget", True, "none", constrained_cache_bytes),
-        ("kv_cache_int8_budget", True, "int8", constrained_cache_bytes),
-        ("kv_cache_int4_budget", True, "int4", constrained_cache_bytes),
+    """14 runs: 1–7 non-fused, 8–14 fused (cache / quant / KV budget). Baseline is run 1 (full recompute)."""
+    base_config = {
+        "n_vocab": n_vocab,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_positions": n_positions,
+        "n_layer": n_layer,
+        "p_dropout": p_dropout,
+        "ln_eps": ln_eps,
+        "backend": backend,
+    }
+    suite_specs: List[Tuple] = [
+        (1, False, False, "none", False),
+        (2, False, True, "none", False),
+        (3, False, True, "int8", False),
+        (4, False, True, "int4", False),
+        (5, False, True, "none", True),
+        (6, False, True, "int8", True),
+        (7, False, True, "int4", True),
+        (8, True, False, "none", False),
+        (9, True, True, "none", False),
+        (10, True, True, "int8", False),
+        (11, True, True, "int4", False),
+        (12, True, True, "none", True),
+        (13, True, True, "int8", True),
+        (14, True, True, "int4", True),
     ]
 
-    for mode, use_cache, kv_cache_quantization, kv_cache_max_bytes in eval_modes:
-        print(f"Starting evaluation for mode={mode} on {len(eval_blocks)} prompts")
-        all_generations = []
-        cache_sizes = []
-        match_rates = []
-        mode_generations = []
+    run_id_filter: Optional[set[int]] = None
+    suite_run_ids = str(suite_run_ids or "").strip()
+    if suite_run_ids:
+        # Fire may pass tuples like "(1,3)"; accept any non-digit separators.
+        run_id_filter = {int(x) for x in re.findall(r"-?\d+", suite_run_ids)}
+        suite_specs = [s for s in suite_specs if int(s[0]) in run_id_filter]
 
-        for block_idx, block in enumerate(tqdm.tqdm(eval_blocks, desc=f"Evaluating ({mode})")):
+    def _make_model(use_fused: bool) -> DecoderLM:
+        m = DecoderLM(**{**base_config, "use_fused_kernel": use_fused})
+        load_model_weights(model=m, path=load_weights_path, backend=backend)
+        return m
+
+    runs_out: List[Dict[str, object]] = []
+    baseline_generations: Optional[List[List[int]]] = None
+    baseline_tps = 0.0
+    model_nf: Optional[DecoderLM] = None
+    model_f: Optional[DecoderLM] = None
+
+    eval_subset = [b for b in eval_blocks if len(b) > prompt_length][:num_prompts]
+
+    for run_id, use_fused, use_cache, quant, budget_limited in suite_specs:
+        if use_fused:
+            if model_f is None:
+                model_f = _make_model(True)
+            model = model_f
+        else:
+            if model_nf is None:
+                model_nf = _make_model(False)
+            model = model_nf
+
+        if not use_cache:
+            q = "none"
+            max_bytes: Optional[int] = None
+        else:
+            q = quant
+            max_bytes = suite_kv_budget_bytes if budget_limited else 0
+
+        was_training = model.training
+        model.eval()
+        desc = f"Run {run_id} (fused={use_fused}, cache={use_cache}, q={q}, budget={budget_limited})"
+        print(f"Starting evaluation for {desc} on {len(eval_subset)} prompts")
+        all_generations: List[float] = []
+        cache_sizes: List[float] = []
+        mode_generations: List[List[int]] = []
+        speed_curves: List[Dict[str, object]] = []
+
+        for block in tqdm.tqdm(eval_subset, desc=desc):
             prompt_ids = block[:prompt_length]
+            model_forward_with_optional_cache_args.kv_cache_max_bytes = max_bytes
             generation = greedy_decode_fixed_tokens(
                 model=model,
                 prompt_ids=prompt_ids,
                 backend=backend,
                 num_new_tokens=num_new_tokens,
                 use_cache=use_cache,
-                kv_cache_quantization=kv_cache_quantization,
-                kv_cache_max_bytes=kv_cache_max_bytes,
+                kv_cache_quantization=q,
+                kv_cache_max_bytes=max_bytes,
             )
-            all_generations.append(generation["tokens_per_sec"])
-            cache_sizes.append(generation["kv_cache_bytes"])
-            mode_generations.append(generation["generated_ids"])
+            all_generations.append(float(generation["tokens_per_sec"]))
+            cache_sizes.append(float(generation["kv_cache_bytes"]))
+            mode_generations.append(list(generation["generated_ids"]))
+            speed_curves.append(generation["generation_speed_curve"])  # type: ignore[arg-type]
 
-            if use_cache:
-                generated = np.array(generation["generated_ids"])
-                baseline_generated = np.array(baseline_generations[block_idx])
-                if baseline_generated.size:
-                    match_rates.append(float(np.mean(generated == baseline_generated)))
-        if not use_cache:
-            baseline_generations = mode_generations
+        if was_training:
+            model.train()
 
-        outputs[mode] = {
-            "prompt_length": prompt_length,
-            "generated_tokens": num_new_tokens,
-            "avg_tokens_per_sec": float(np.mean(all_generations)) if all_generations else 0.0,
-            "avg_kv_cache_bytes": float(np.mean(cache_sizes)) if cache_sizes else 0.0,
-            "kv_cache_quantization": kv_cache_quantization if use_cache else "none",
-            "kv_cache_max_bytes": kv_cache_max_bytes if use_cache else None,
-        }
-        if use_cache and match_rates:
-            outputs[mode]["avg_token_match_rate_vs_full"] = float(np.mean(match_rates))
+        tps = float(np.mean(all_generations)) if all_generations else 0.0
+        kv_b = float(np.mean(cache_sizes)) if use_cache else 0.0
+        gens = mode_generations
 
-    if outputs.get("full_recompute"):
-        base_tps = outputs["full_recompute"]["avg_tokens_per_sec"]
-        outputs["speedup"] = {
-            mode: outputs[mode]["avg_tokens_per_sec"] / max(base_tps, 1e-8)
-            for mode in (
-                "kv_cache",
-                "kv_cache_int8",
-                "kv_cache_int4",
-                "kv_cache_budget",
-                "kv_cache_int8_budget",
-                "kv_cache_int4_budget",
+        if run_id == 1:
+            baseline_generations = gens
+            baseline_tps = tps
+
+        assert baseline_generations is not None
+        match_vs = _mean_token_match_vs_reference(gens, baseline_generations)
+        if debug_compare_run_id and run_id == int(debug_compare_run_id) and gens and baseline_generations:
+            n_show = max(int(debug_print_first_n_tokens), 1)
+            # Summarize divergence across ALL prompts, and show token prefixes for prompt 0.
+            per_prompt_div = [
+                _first_divergence_index(list(r), list(g))
+                for r, g in zip(baseline_generations, gens)
+            ]
+            per_prompt_match = [
+                float(np.mean(np.asarray(g[: min(len(g), len(r))], dtype=np.int64) == np.asarray(r[: min(len(g), len(r))], dtype=np.int64)))
+                if min(len(g), len(r)) > 0
+                else 0.0
+                for r, g in zip(baseline_generations, gens)
+            ]
+
+            a = list(baseline_generations[0])
+            b = list(gens[0])
+            div = int(per_prompt_div[0]) if per_prompt_div else _first_divergence_index(a, b)
+            print(
+                json.dumps(
+                    {
+                        "debug_compare": {
+                            "run_id": int(run_id),
+                            "prompt_index_shown": 0,
+                            "first_divergence_token_index_shown": int(div),
+                            "first_divergence_token_index_per_prompt": per_prompt_div,
+                            "token_match_rate_vs_run1_per_prompt": per_prompt_match,
+                            "baseline_run1_generated_ids_prefix": a[:n_show],
+                            "this_run_generated_ids_prefix": b[:n_show],
+                        }
+                    },
+                    indent=4,
+                )
             )
-            if mode in outputs
-        }
+        speedup_vs = tps / max(baseline_tps, 1e-8)
+        agg_curve = _aggregate_generation_speed_curves(speed_curves)
 
-    if was_training:
-        model.train()
+        runs_out.append(
+            {
+                "run_id": run_id,
+                "use_fused_kernel": use_fused,
+                "use_cache": use_cache,
+                "kv_cache_quantization": q if use_cache else "none",
+                "kv_cache_max_bytes": max_bytes if use_cache else None,
+                "kv_budget_limited": bool(budget_limited) if use_cache else False,
+                "avg_tokens_per_sec": tps,
+                "avg_kv_cache_bytes": kv_b,
+                "vs_baseline_run1_token_match_rate": match_vs,
+                "vs_baseline_run1_speedup": speedup_vs,
+                "generation_speed_curve": agg_curve,
+            }
+        )
 
-    print(json.dumps(outputs, indent=4))
-    return outputs
+    payload = {
+        "baseline_run_id": 1,
+        "baseline_avg_tokens_per_sec": baseline_tps,
+        "suite_kv_budget_bytes": suite_kv_budget_bytes,
+        "runs": runs_out,
+    }
+    print(json.dumps(payload, indent=4))
+    return payload
 
 
 def main(
@@ -340,6 +526,10 @@ def main(
     max_test_texts=0,
     max_train_blocks=0,
     max_eval_blocks=512,
+    suite_kv_budget_bytes=128 * 1024,
+    debug_compare_run_id=0,
+    debug_print_first_n_tokens=80,
+    suite_run_ids="",
 ):
     np.random.seed(seed)
     random.seed(seed)
@@ -433,13 +623,25 @@ def main(
     save_model_config(config=config, path=f"{artifact_dir}/model_config.json")
 
     if run_generation_eval:
+        suite_weights = load_weights_path if load_weights_path is not None else save_weights_path
         benchmark_autoregressive_generation(
-            model=model,
-            blocks=eval_blocks,
+            load_weights_path=suite_weights,
+            eval_blocks=eval_blocks,
             backend=backend,
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=config["n_head"],
+            n_positions=model_max_length,
+            n_layer=config["n_layer"],
+            p_dropout=config["p_dropout"],
+            ln_eps=config["ln_eps"],
             prompt_length=generation_prompt_length,
             num_new_tokens=generation_max_new_tokens,
             num_prompts=generation_examples,
+            suite_kv_budget_bytes=int(suite_kv_budget_bytes),
+            debug_compare_run_id=int(debug_compare_run_id),
+            debug_print_first_n_tokens=int(debug_print_first_n_tokens),
+            suite_run_ids=str(suite_run_ids),
         )
 
 

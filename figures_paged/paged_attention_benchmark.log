@@ -1,0 +1,10 @@
+Starting paged attention benchmark with 2 prompts
+Run 1: mode=paged_attention, paged=True, quant=none
+{"run_id": 1, "avg_time_per_token_sec": 0.25356971996649613, "peak_memory_usage_bytes": 995104}
+Run 2: mode=paged_attention, paged=True, quant=int8
+{"run_id": 2, "avg_time_per_token_sec": 0.25448943362971477, "peak_memory_usage_bytes": 251744}
+Run 3: mode=old_attention, paged=False, quant=none
+{"run_id": 3, "avg_time_per_token_sec": 0.252402799086849, "peak_memory_usage_bytes": 995104}
+Run 4: mode=old_attention, paged=False, quant=int8
+{"run_id": 4, "avg_time_per_token_sec": 0.2543448029700812, "peak_memory_usage_bytes": 251712}
+Wrote JSON results to figures_paged/paged_attention_benchmark.json

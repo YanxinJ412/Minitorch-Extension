@@ -1,8 +1,9 @@
+import builtins
 import math
 import numpy as np
 from .tensor import tensor, tensor_from_numpy
 from .module import Module, Parameter
-from .kv_cache import KVCache, LayerKVCache
+from .kv_cache import KVCache, LayerKVCache, PagedKVCache, PagedLayerKVCache
 from .modules_basic import (
     Embedding,
     Dropout,
@@ -16,13 +17,13 @@ from .nn import (
     dropout,
     GELU,
 )
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False, use_paged_attention: bool=False, use_flash_attention: bool=False):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -46,6 +47,8 @@ class MultiHeadAttention(Module):
         self.causal    = causal
         self.attn_hidden_dim = n_embd // n_head
         self.use_fused_kernel = use_fused_kernel
+        self.use_paged_attention = use_paged_attention
+        self.use_flash_attention = use_flash_attention
 
         # COPY FROM ASSIGN2_4
         # raise NotImplementedError
@@ -110,7 +113,7 @@ class MultiHeadAttention(Module):
         q,
         k,
         v,
-        layer_cache: Optional[LayerKVCache]=None,
+        layer_cache: Optional[Union[LayerKVCache, PagedLayerKVCache]]=None,
         use_cache: bool=False,
         query_positions=None,
     ):
@@ -132,7 +135,7 @@ class MultiHeadAttention(Module):
         _, _, _, k_dim = k.shape
         _, _, _, v_dim = v.shape
         assert q_dim == k_dim == v_dim
-        result = None
+        # result = None
         past_len = 0
         key_positions = None
         if query_positions is not None:
@@ -145,9 +148,174 @@ class MultiHeadAttention(Module):
             if query_positions is None:
                 query_positions = np.arange(past_len, past_len + queries_len, dtype=np.int64)
             layer_cache.append(k, v, query_positions)
+            key_positions = layer_cache.positions
+            key_len = layer_cache.seq_len
+        else:
+            key_len = k.shape[2]
+
+        use_fused_decode = (
+            self.use_fused_kernel
+            and use_cache
+            and layer_cache is not None
+            and queries_len == 1
+            and not self.dropout.training
+            and getattr(self.backend, "supports_fused_decode_attn", False)
+        )
+        fused_buf = (
+            layer_cache.fused_decode_buffers()
+            if use_fused_decode and layer_cache is not None
+            else None
+        )
+
+        use_flash_decode = (
+            self.use_flash_attention
+            and use_cache
+            and layer_cache is not None
+            and queries_len == 1
+            and not self.dropout.training
+            and getattr(self.backend, "supports_flash_decode_attn", False)
+        )
+        flash_buf = None
+        if use_flash_decode and layer_cache is not None:
+            maybe_buf = layer_cache.fused_decode_buffers()
+            if maybe_buf is not None and maybe_buf[0] == "fp32":
+                flash_buf = maybe_buf
+
+        use_flash_full = (
+            self.use_flash_attention
+            and (not use_cache)
+            and self.causal
+            and (not self.dropout.training)
+            and getattr(self.backend, "supports_flash_attn", False)
+        )
+
+        use_paged_decode = (
+            self.use_paged_attention
+            and use_cache
+            and layer_cache is not None
+            and queries_len == 1
+            and not self.dropout.training
+            and getattr(self.backend, "supports_paged_decode_attn", False)
+            and hasattr(layer_cache, "paged_decode_buffers")
+        )
+        paged_buf = (
+            layer_cache.paged_decode_buffers()
+            if use_paged_decode and layer_cache is not None
+            else None
+        )
+
+        if flash_buf is not None:
+            _mode, kn, vn, _ks, _vs, _seq_len = flash_buf
+            mask_t = self.create_causal_mask(
+                batch_size,
+                num_head,
+                queries_len,
+                key_len,
+                past_len=past_len,
+                query_positions=query_positions,
+                key_positions=key_positions,
+            )
+            attn_out = self.backend.flash_decode_attn_fw(
+                q.contiguous(),
+                mask_t.contiguous(),
+                kn,
+                vn,
+                q_dim,
+            )
+            result = attn_out.permute(0, 2, 1, 3).contiguous()
+            result_2d = result.view(batch_size * queries_len, self.n_embd)
+            result_2d = self.out_projection(result_2d)
+            result = result_2d.view(batch_size, queries_len, self.n_embd)
+            return result
+
+        if use_flash_full:
+            mask_t = self.create_causal_mask(
+                batch_size,
+                num_head,
+                queries_len,
+                key_len,
+                past_len=0,
+                query_positions=query_positions,
+                key_positions=key_positions,
+            )
+            attn_out = self.backend.flash_attn_fw(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                mask_t.contiguous(),
+                q_dim,
+            )
+            result = attn_out.permute(0, 2, 1, 3).contiguous()
+            result_2d = result.view(batch_size * queries_len, self.n_embd)
+            result_2d = self.out_projection(result_2d)
+            result = result_2d.view(batch_size, queries_len, self.n_embd)
+            return result
+
+        if paged_buf is not None:
+            mode, kn, vn, page_offsets, k_scales, v_scales, total_seq, page_size = paged_buf
+            mask_t = self.create_causal_mask(
+                batch_size,
+                num_head,
+                queries_len,
+                total_seq,
+                past_len=past_len,
+                query_positions=query_positions,
+                key_positions=key_positions,
+            )
+            attn_out = self.backend.paged_decode_attn_fw(
+                q.contiguous(),
+                mask_t.contiguous(),
+                mode,
+                kn,
+                vn,
+                page_offsets,
+                k_scales,
+                v_scales,
+                q_dim,
+                page_size=page_size,
+            )
+            result = attn_out.permute(0, 2, 1, 3).contiguous()
+            result_2d = result.view(batch_size * queries_len, self.n_embd)
+            result_2d = self.out_projection(result_2d)
+            result = result_2d.view(batch_size, queries_len, self.n_embd)
+            return result
+
+        if fused_buf is not None:
+            # fused_buf may include seq_len for packed formats (e.g. int4)
+            if len(fused_buf) == 5:
+                mode, kn, vn, ks, vs = fused_buf
+                seq_len_override = None
+            else:
+                mode, kn, vn, ks, vs, seq_len_override = fused_buf
+            mask_t = self.create_causal_mask(
+                batch_size,
+                num_head,
+                queries_len,
+                key_len,
+                past_len=past_len,
+                query_positions=query_positions,
+                key_positions=key_positions,
+            )
+            attn_out = self.backend.fused_decode_attn_fw(
+                q.contiguous(),
+                mask_t.contiguous(),
+                mode,
+                kn,
+                vn,
+                ks,
+                vs,
+                q_dim,
+                seq_len_override=seq_len_override,
+            )
+            result = attn_out.permute(0, 2, 1, 3).contiguous()
+            result_2d = result.view(batch_size * queries_len, self.n_embd)
+            result_2d = self.out_projection(result_2d)
+            result = result_2d.view(batch_size, queries_len, self.n_embd)
+            return result
+
+        if use_cache:
             k = layer_cache.key
             v = layer_cache.value
-            key_positions = layer_cache.positions
 
         kT = k.permute(0, 1, 3, 2)
         key_len = k.shape[2]
@@ -187,7 +355,11 @@ class MultiHeadAttention(Module):
                     query_positions=query_positions,
                     key_positions=key_positions,
                 )
-            attn = attn.attn_softmax(attn)
+            # NOTE: the provided attn_softmax CUDA kernel expects a different mask layout
+            # and can silently compute incorrect results with the 4D causal mask used here.
+            # Keep correctness by using the reference softmax while still allowing our
+            # fused decode attention path above to accelerate single-token KV-cache decoding.
+            attn = softmax(attn, dim=3)
             attn = self.dropout(attn)
             result = attn @ v
             result = result.permute(0, 2, 1, 3).contiguous()
@@ -198,7 +370,7 @@ class MultiHeadAttention(Module):
 
         return result
 
-    def forward(self, x, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False, query_positions=None):
+    def forward(self, x, layer_cache: Optional[Union[LayerKVCache, PagedLayerKVCache]]=None, use_cache: bool=False, query_positions=None):
         """Computes MultiHeadAttention with causal masking if needed. 
 
         Args:
@@ -262,7 +434,7 @@ class FeedForward(Module):
         return x
 
 class TransformerLayer(Module):
-    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-8, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False):
+    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-8, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False, use_paged_attention: bool=False, use_flash_attention: bool=False):
         super().__init__()
         """A Transformer Layer in a Pre-LN Transformer.
 
@@ -284,10 +456,12 @@ class TransformerLayer(Module):
         # self.attention
         # self.ff
         # raise NotImplementedError
-        self.attention = MultiHeadAttention(n_embd, n_head, True, p_dropout, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.attention = MultiHeadAttention(n_embd, n_head, True, p_dropout, bias, backend, use_fused_kernel=use_fused_kernel, use_paged_attention=use_paged_attention, use_flash_attention=use_flash_attention)
         self.ff = FeedForward(n_embd, p_dropout=p_dropout, bias=bias, backend=backend)
 
         self.use_fused_kernel = use_fused_kernel
+        self.use_paged_attention = use_paged_attention
+        self.use_flash_attention = use_flash_attention
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             # self.ln_1
@@ -302,7 +476,7 @@ class TransformerLayer(Module):
             self.ln_2 = LayerNorm1d(n_embd, ln_eps, backend)
             # END ASSIGN3_3
 
-    def forward(self, x, layer_cache: Optional[LayerKVCache]=None, use_cache: bool=False, query_positions=None):
+    def forward(self, x, layer_cache: Optional[Union[LayerKVCache, PagedLayerKVCache]]=None, use_cache: bool=False, query_positions=None):
         """
         The forward function of a Transformer Layer for a PRENORM Transformer.
         Input: the hidden states from previous layers `x` with shape (batch_size, seq_len, x_dim)
@@ -362,6 +536,9 @@ class DecoderLM(Module):
         bias: bool=True,
         backend: TensorBackend=None,
         use_fused_kernel: bool=False,
+        use_paged_attention: bool=False,
+        use_flash_attention: bool=False,
+        kv_cache_page_size: int=64,
     ):
         super().__init__()
         """A Full Decoder-only Pre-LN Transformer with 4 Transformer Layers.
@@ -388,6 +565,8 @@ class DecoderLM(Module):
         """
         self.backend             = backend
         self.n_embd              = n_embd
+        self.n_head              = n_head
+        self.n_positions         = n_positions
         self.n_vocab             = n_vocab
         self.n_layer             = n_layer
         if n_layer < 1 or n_layer > 4:
@@ -405,10 +584,10 @@ class DecoderLM(Module):
         # raise NotImplementedError
         self.token_embeddings = Embedding(n_vocab, n_embd, backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend)
-        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
-        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
-        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
-        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel, use_paged_attention=use_paged_attention, use_flash_attention=use_flash_attention)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel, use_paged_attention=use_paged_attention, use_flash_attention=use_flash_attention)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel, use_paged_attention=use_paged_attention, use_flash_attention=use_flash_attention)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel=use_fused_kernel, use_paged_attention=use_paged_attention, use_flash_attention=use_flash_attention)
         self.layers = [
             self.t_layer_1,
             self.t_layer_2,
@@ -419,6 +598,9 @@ class DecoderLM(Module):
         self.lm_head = Linear(n_embd, n_vocab, bias, backend)
 
         self.use_fused_kernel = use_fused_kernel
+        self.use_paged_attention = use_paged_attention
+        self.use_flash_attention = use_flash_attention
+        self.kv_cache_page_size = builtins.max(int(kv_cache_page_size), 1)
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             # self.ln                  = 
@@ -432,9 +614,17 @@ class DecoderLM(Module):
         
     def init_kv_cache(
         self,
-        quantization: Optional[str]=None,
+        quantization=None,
         max_cache_bytes: Optional[int]=None,
-    ) -> KVCache:
+    ):
+        if self.use_paged_attention:
+            return PagedKVCache(
+                n_layers=self.n_layer,
+                backend=self.backend,
+                quantization=quantization,
+                max_cache_bytes=max_cache_bytes,
+                page_size=self.kv_cache_page_size,
+            )
         return KVCache(
             n_layers=self.n_layer,
             backend=self.backend,
@@ -445,7 +635,7 @@ class DecoderLM(Module):
     def forward(
         self,
         idx,
-        kv_cache: Optional[KVCache]=None,
+        kv_cache: Optional[Union[KVCache, PagedKVCache]]=None,
         use_cache: bool=False,
         kv_cache_quantization: Optional[str]=None,
         kv_cache_max_bytes: Optional[int]=None,

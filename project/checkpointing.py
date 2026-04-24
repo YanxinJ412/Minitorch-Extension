@@ -42,6 +42,10 @@ def save_model_config(config: Dict[str, object], path: str) -> None:
         json.dump(serializable, f, indent=4)
 
 
+# Keys that may differ between train/save and load without breaking weight compatibility.
+_CONFIG_KEYS_IGNORE_MISMATCH = frozenset({"use_fused_kernel", "use_paged_attention", "use_flash_attention", "kv_cache_page_size"})
+
+
 def validate_model_config(config: Dict[str, object], path: str) -> None:
     with open(path) as f:
         saved = json.load(f)
@@ -54,6 +58,8 @@ def validate_model_config(config: Dict[str, object], path: str) -> None:
 
     mismatches = {}
     for key, expected_value in expected.items():
+        if key in _CONFIG_KEYS_IGNORE_MISMATCH:
+            continue
         saved_value = saved.get(key)
         if saved_value != expected_value:
             mismatches[key] = {
