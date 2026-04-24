@@ -203,43 +203,6 @@ Writes to `figures/benchmark/seven_mode/` (e.g. `bench_run_ex_5_tps.png`, `bench
 
 Default output directory is `figures/benchmark/suite14/`.
 
----
-
-## Run paged-attention benchmark (4 modes)
-
-This repo also includes a separate benchmark focused on comparing the new paged KV-cache path against the old KV-cache path.
-
-It runs these four modes:
-
-1. paged attention + paged KV cache + FP32 KV
-2. paged attention + paged KV cache + INT8 KV
-3. old attention + old KV cache + FP32 KV
-4. old attention + old KV cache + INT8 KV
-
-Outputs include, for each run:
-
-- `time_per_token_sec`: averaged per-token decode-time curve
-- `dynamic_memory_usage_bytes`: averaged memory-usage curve over decode
-- `peak_memory_usage_bytes`: peak memory usage seen during the run
-
-Example:
-
-```bash
-python project/run_paged_attention_benchmark.py \
-  --model_max_length=128 \
-  --n_epochs=0 \
-  --load_weights_path=./workdir_autoregressive_128/model_weights.npz \
-  --generation_max_new_tokens=120 \
-  --generation_examples=2 \
-  --kv_cache_page_size=64
-```
-
-Build the new CUDA kernel first:
-
-```bash
-bash compile_cuda.sh
-```
-
 ### Speed curves
 
 ```bash
