@@ -7,8 +7,8 @@
 #SBATCH --time=02:30:00
 #SBATCH -c 4
 #SBATCH --mem=16G
-#SBATCH -o slurm-%j.out
-#SBATCH -e slurm-%j.err
+#SBATCH -o logs/slurm-%j.out
+#SBATCH -e logs/slurm-%j.err
 
 set -euo pipefail
 
@@ -23,8 +23,10 @@ export PYTHONPATH=$PWD
 echo "Running on $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-unknown}"
 
+mkdir -p logs
+
 .venv/bin/python project/run_autoregressive_benchmark.py \
   --model_max_length=128 --n_epochs=0 \
   --load_weights_path=./workdir_autoregressive_128/model_weights.npz \
   --generation_max_new_tokens=120 --generation_examples=2 \
-  > bench_run_examples=2.log 2>&1
+  > logs/bench_run_examples=2.log 2>&1

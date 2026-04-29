@@ -1,6 +1,0 @@
-Starting flash attention benchmark with 2 prompts
-Run 1: mode=full_compute_no_cache, flash=False
-{"run_id": 1, "avg_tokens_per_sec": 3.491288945929186}
-Run 2: mode=flash_attention_no_cache, flash=True
-{"run_id": 2, "avg_tokens_per_sec": 3.7421197254643994}
-Wrote JSON results to figures_flash/flash_attention_benchmark.json

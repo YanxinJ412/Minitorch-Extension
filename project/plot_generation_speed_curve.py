@@ -67,6 +67,30 @@ def _curve_for_run(runs: List[Dict[str, Any]], run_id: int) -> Optional[Dict[str
     return None
 
 
+def _legend_label_for_run(runs: List[Dict[str, Any]], run_id: int) -> str:
+    r = next((x for x in runs if int(x.get("run_id", -1)) == run_id), None)
+    if r is None:
+        return f"Run {run_id}"
+    fused = bool(r.get("use_fused_kernel"))
+    cache = bool(r.get("use_cache"))
+    q = str(r.get("kv_cache_quantization", "none"))
+    bud = bool(r.get("kv_budget_limited"))
+
+    if not cache:
+        return f"Run {run_id}: full recompute ({'fused' if fused else 'non-fused'})"
+
+    q_short = {"none": "FP32", "int8": "INT8", "int4": "INT4"}.get(q, q)
+    parts = [
+        f"Run {run_id}",
+        "fused" if fused else "non-fused",
+        "cache",
+        q_short,
+    ]
+    if bud:
+        parts.append("budget")
+    return f"{parts[0]}: " + " ".join(parts[1:])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--json", type=Path, required=True, help="Suite JSON file or tee log containing it")
@@ -110,11 +134,7 @@ def main() -> None:
         if args.cumulative:
             # Cumulative time to generate up to token index x[k]
             y = list(__import__("numpy").cumsum([float(v) for v in y]).tolist())
-        fused = next((r.get("use_fused_kernel") for r in runs if int(r.get("run_id", -1)) == rid), None)
-        cache = next((r.get("use_cache") for r in runs if int(r.get("run_id", -1)) == rid), None)
-        q = next((r.get("kv_cache_quantization") for r in runs if int(r.get("run_id", -1)) == rid), None)
-        bud = next((r.get("kv_budget_limited") for r in runs if int(r.get("run_id", -1)) == rid), None)
-        label = f"Run {rid} (fused={fused}, cache={cache}, q={q}, budget={bud})"
+        label = _legend_label_for_run(runs, rid)
         ax.plot(x, y, marker="o", linewidth=1.5, markersize=4, label=label)
 
     ax.set_xlabel("Cumulative generated tokens (end of each 10-token chunk)")
@@ -122,7 +142,7 @@ def main() -> None:
         ax.set_ylabel("Cumulative decode time (seconds)")
         ax.set_title("Cumulative decode time vs generated tokens (chunk size = 10)")
     else:
-        ax.set_ylabel("Wall time per 10 generated tokens (seconds)")
+        ax.set_ylabel("Time to generate each 10 tokens (seconds)")
         ax.set_title("Time per 10 tokens as decoding progresses (chunk size = 10)")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)

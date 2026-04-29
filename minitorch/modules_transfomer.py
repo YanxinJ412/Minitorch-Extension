@@ -355,10 +355,6 @@ class MultiHeadAttention(Module):
                     query_positions=query_positions,
                     key_positions=key_positions,
                 )
-            # NOTE: the provided attn_softmax CUDA kernel expects a different mask layout
-            # and can silently compute incorrect results with the 4D causal mask used here.
-            # Keep correctness by using the reference softmax while still allowing our
-            # fused decode attention path above to accelerate single-token KV-cache decoding.
             attn = softmax(attn, dim=3)
             attn = self.dropout(attn)
             result = attn @ v
