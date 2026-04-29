@@ -98,6 +98,14 @@ class TensorBackend:
         self.attn_softmax_bw = ops.attn_softmax_bw
         self.layernorm_fw = ops.layernorm_fw
         self.layernorm_bw = ops.layernorm_bw
+        self.fused_decode_attn_fw = getattr(ops, "fused_decode_attn_fw", None)
+        self.flash_decode_attn_fw = getattr(ops, "flash_decode_attn_fw", None)
+        self.flash_attn_fw = getattr(ops, "flash_attn_fw", None)
+        self.paged_decode_attn_fw = getattr(ops, "paged_decode_attn_fw", None)
+        self.supports_fused_decode_attn = getattr(ops, "supports_fused_decode_attn", False)
+        self.supports_flash_decode_attn = getattr(ops, "supports_flash_decode_attn", False)
+        self.supports_flash_attn = getattr(ops, "supports_flash_attn", False)
+        self.supports_paged_decode_attn = getattr(ops, "supports_paged_decode_attn", False)
 
 
 class SimpleOps(TensorOps):

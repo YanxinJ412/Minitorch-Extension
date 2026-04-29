@@ -8,9 +8,19 @@ ENV/
 workdir/
 workdir*/
 
+hf_cache/
+hf_cache*/
+
 # Batch / Slurm logs
+*.log
 *.err
 *.out
+logs/
+slurm_msg/
+sbatch_msg/
+
+# Poster
+poster/
 
 # Python
 __pycache__/

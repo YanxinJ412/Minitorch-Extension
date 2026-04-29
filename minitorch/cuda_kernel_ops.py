@@ -1,5 +1,7 @@
 from typing import Callable, Optional
 
+import math
+
 from . import operators
 from .tensor import Tensor
 from .tensor_data import (
@@ -26,7 +28,140 @@ import torch
 lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
 lib_softmax = ctypes.CDLL("minitorch/cuda_kernels/softmax_kernel.so")
 lib_layernorm = ctypes.CDLL("minitorch/cuda_kernels/layernorm_kernel.so")
+lib_fused = ctypes.CDLL("minitorch/cuda_kernels/fused_decode_attn.so")
+try:
+    lib_flash = ctypes.CDLL("minitorch/cuda_kernels/flash_decode_attn.so")
+except OSError:
+    lib_flash = None
+try:
+    lib_paged = ctypes.CDLL("minitorch/cuda_kernels/paged_decode_attn.so")
+except OSError:
+    lib_paged = None
 datatype = np.float32
+
+lib_fused.fused_decode_attn_host_fp32.argtypes = [
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_float,
+]
+lib_fused.fused_decode_attn_host_fp32.restype = None
+
+lib_fused.fused_decode_attn_host_int8.argtypes = [
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.int8, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.int8, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_float,
+    ctypes.c_float,
+    ctypes.c_float,
+]
+lib_fused.fused_decode_attn_host_int8.restype = None
+
+try:
+    _lib_fused_int4 = lib_fused.fused_decode_attn_host_int4
+except AttributeError:
+    _lib_fused_int4 = None
+else:
+    _lib_fused_int4.argtypes = [
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.uint8, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.uint8, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_float,
+    ]
+    _lib_fused_int4.restype = None
+
+if lib_paged is not None:
+    lib_paged.paged_decode_attn_host_fp32.argtypes = [
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.int32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    lib_paged.paged_decode_attn_host_fp32.restype = None
+
+    lib_paged.paged_decode_attn_host_int8.argtypes = [
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.int8, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.int8, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.int32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    lib_paged.paged_decode_attn_host_int8.restype = None
+
+if lib_flash is not None:
+    lib_flash.flash_decode_attn_host_fp32.argtypes = [
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    lib_flash.flash_decode_attn_host_fp32.restype = None
+    try:
+        _lib_flash_full = lib_flash.flash_attn_host_fp32
+    except AttributeError:
+        _lib_flash_full = None
+    else:
+        _lib_flash_full.argtypes = [
+            np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.float32, ndim=1, flags="C_CONTIGUOUS"),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+        ]
+        _lib_flash_full.restype = None
+else:
+    _lib_flash_full = None
 
 # function map
 fn_map = {
@@ -53,6 +188,11 @@ fn_map = {
 THREADS_PER_BLOCK = 32
 
 class CudaKernelOps(TensorOps):
+    supports_fused_decode_attn = True
+    supports_flash_decode_attn = lib_flash is not None
+    supports_flash_attn = _lib_flash_full is not None
+    supports_paged_decode_attn = lib_paged is not None
+
     @staticmethod
     def map(fn: Callable[[float], float]) -> MapProto:
         "See `tensor_ops.py`"
@@ -370,6 +510,236 @@ class CudaKernelOps(TensorOps):
         if more_3d:
             out = out.view(*ls)
             # print(f"Debug in matmul: output shape {out.shape}")
+        return out
+
+    @staticmethod
+    def fused_decode_attn_fw(
+        q: Tensor,
+        mask: Tensor,
+        kv_mode: str,
+        k_np: np.ndarray,
+        v_np: np.ndarray,
+        k_scale: float,
+        v_scale: float,
+        q_dim: int,
+        seq_len_override: Optional[int] = None,
+    ) -> Tensor:
+        """Single-query attention with fused CUDA kernel; ``k_np``/``v_np`` are numpy buffers.
+
+        For ``kv_mode='int4'``, K/V are packed uint8 buffers (1D) and ``seq_len_override`` is required.
+        """
+        batch_size, num_head, queries_len, d_head = q.shape
+        assert queries_len == 1
+        if kv_mode == "int4":
+            if seq_len_override is None:
+                raise ValueError("seq_len_override is required for kv_mode='int4'")
+            seq_len = int(seq_len_override)
+        else:
+            assert k_np.shape == v_np.shape
+            seq_len = int(k_np.shape[2])
+            assert k_np.shape == (batch_size, num_head, seq_len, d_head)
+        inv_sqrt_d = 1.0 / math.sqrt(float(q_dim))
+        q_flat = np.ascontiguousarray(q.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        mask_flat = np.ascontiguousarray(mask.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        out = q.zeros((batch_size, num_head, 1, d_head))
+        out_flat = out._tensor._storage
+        if kv_mode == "fp32":
+            k_flat = np.ascontiguousarray(k_np, dtype=np.float32).reshape(-1)
+            v_flat = np.ascontiguousarray(v_np, dtype=np.float32).reshape(-1)
+            lib_fused.fused_decode_attn_host_fp32(
+                q_flat,
+                k_flat,
+                v_flat,
+                mask_flat,
+                out_flat,
+                ctypes.c_int(batch_size),
+                ctypes.c_int(num_head),
+                ctypes.c_int(seq_len),
+                ctypes.c_int(d_head),
+                ctypes.c_float(inv_sqrt_d),
+            )
+        elif kv_mode == "int8":
+            k_flat = np.ascontiguousarray(k_np, dtype=np.int8).reshape(-1)
+            v_flat = np.ascontiguousarray(v_np, dtype=np.int8).reshape(-1)
+            lib_fused.fused_decode_attn_host_int8(
+                q_flat,
+                k_flat,
+                v_flat,
+                mask_flat,
+                out_flat,
+                ctypes.c_int(batch_size),
+                ctypes.c_int(num_head),
+                ctypes.c_int(seq_len),
+                ctypes.c_int(d_head),
+                ctypes.c_float(inv_sqrt_d),
+                ctypes.c_float(float(k_scale)),
+                ctypes.c_float(float(v_scale)),
+            )
+        elif kv_mode == "int4":
+            if _lib_fused_int4 is None:
+                raise RuntimeError(
+                    "fused_decode_attn.so does not export INT4 support. Rebuild with bash compile_cuda.sh"
+                )
+            k_flat = np.ascontiguousarray(k_np, dtype=np.uint8).reshape(-1)
+            v_flat = np.ascontiguousarray(v_np, dtype=np.uint8).reshape(-1)
+            _lib_fused_int4(
+                q_flat,
+                k_flat,
+                v_flat,
+                mask_flat,
+                out_flat,
+                ctypes.c_int(batch_size),
+                ctypes.c_int(num_head),
+                ctypes.c_int(seq_len),
+                ctypes.c_int(d_head),
+                ctypes.c_float(inv_sqrt_d),
+                ctypes.c_float(float(k_scale)),
+                ctypes.c_float(float(v_scale)),
+            )
+        else:
+            raise ValueError(f"Unsupported fused KV mode '{kv_mode}'")
+        return out
+
+    @staticmethod
+    def paged_decode_attn_fw(
+        q: Tensor,
+        mask: Tensor,
+        kv_mode: str,
+        k_pages_np: np.ndarray,
+        v_pages_np: np.ndarray,
+        page_offsets_np: np.ndarray,
+        k_scales_np: np.ndarray,
+        v_scales_np: np.ndarray,
+        q_dim: int,
+        page_size: int,
+    ) -> Tensor:
+        if lib_paged is None:
+            raise RuntimeError("paged_decode_attn.so is not available; run bash compile_cuda.sh")
+
+        batch_size, num_head, queries_len, d_head = q.shape
+        assert queries_len == 1
+        total_seq = int(page_offsets_np[-1]) if page_offsets_np.size > 0 else 0
+        num_pages = max(int(page_offsets_np.shape[0]) - 1, 0)
+        inv_sqrt_d = 1.0 / math.sqrt(float(q_dim))
+        q_flat = np.ascontiguousarray(q.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        mask_flat = np.ascontiguousarray(mask.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        page_offsets = np.ascontiguousarray(page_offsets_np, dtype=np.int32).reshape(-1)
+        out = q.zeros((batch_size, num_head, 1, d_head))
+        out_flat = out._tensor._storage
+        if kv_mode == "fp32":
+            k_flat = np.ascontiguousarray(k_pages_np, dtype=np.float32).reshape(-1)
+            v_flat = np.ascontiguousarray(v_pages_np, dtype=np.float32).reshape(-1)
+            lib_paged.paged_decode_attn_host_fp32(
+                q_flat,
+                k_flat,
+                v_flat,
+                page_offsets,
+                mask_flat,
+                out_flat,
+                ctypes.c_int(batch_size),
+                ctypes.c_int(num_head),
+                ctypes.c_int(num_pages),
+                ctypes.c_int(page_size),
+                ctypes.c_int(total_seq),
+                ctypes.c_int(d_head),
+                ctypes.c_float(inv_sqrt_d),
+            )
+        elif kv_mode == "int8":
+            k_flat = np.ascontiguousarray(k_pages_np, dtype=np.int8).reshape(-1)
+            v_flat = np.ascontiguousarray(v_pages_np, dtype=np.int8).reshape(-1)
+            k_scales = np.ascontiguousarray(k_scales_np, dtype=np.float32).reshape(-1)
+            v_scales = np.ascontiguousarray(v_scales_np, dtype=np.float32).reshape(-1)
+            lib_paged.paged_decode_attn_host_int8(
+                q_flat,
+                k_flat,
+                v_flat,
+                page_offsets,
+                k_scales,
+                v_scales,
+                mask_flat,
+                out_flat,
+                ctypes.c_int(batch_size),
+                ctypes.c_int(num_head),
+                ctypes.c_int(num_pages),
+                ctypes.c_int(page_size),
+                ctypes.c_int(total_seq),
+                ctypes.c_int(d_head),
+                ctypes.c_float(inv_sqrt_d),
+            )
+        else:
+            raise ValueError(f"Unsupported paged KV mode '{kv_mode}'")
+        return out
+
+    @staticmethod
+    def flash_decode_attn_fw(
+        q: Tensor,
+        mask: Tensor,
+        k_np: np.ndarray,
+        v_np: np.ndarray,
+        q_dim: int,
+    ) -> Tensor:
+        if lib_flash is None:
+            raise RuntimeError("flash_decode_attn.so is not available; run bash compile_cuda.sh")
+
+        batch_size, num_head, queries_len, d_head = q.shape
+        assert queries_len == 1
+        assert k_np.shape == v_np.shape
+        seq_len = int(k_np.shape[2])
+        inv_sqrt_d = 1.0 / math.sqrt(float(q_dim))
+        q_flat = np.ascontiguousarray(q.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        mask_flat = np.ascontiguousarray(mask.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        k_flat = np.ascontiguousarray(k_np, dtype=np.float32).reshape(-1)
+        v_flat = np.ascontiguousarray(v_np, dtype=np.float32).reshape(-1)
+        out = q.zeros((batch_size, num_head, 1, d_head))
+        out_flat = out._tensor._storage
+        lib_flash.flash_decode_attn_host_fp32(
+            q_flat,
+            k_flat,
+            v_flat,
+            mask_flat,
+            out_flat,
+            ctypes.c_int(batch_size),
+            ctypes.c_int(num_head),
+            ctypes.c_int(seq_len),
+            ctypes.c_int(d_head),
+            ctypes.c_float(inv_sqrt_d),
+        )
+        return out
+
+    @staticmethod
+    def flash_attn_fw(
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Tensor,
+        q_dim: int,
+    ) -> Tensor:
+        if _lib_flash_full is None:
+            raise RuntimeError("flash_decode_attn.so does not export full flash attention; run bash compile_cuda.sh")
+
+        batch_size, num_head, queries_len, d_head = q.shape
+        assert k.shape == v.shape
+        key_len = int(k.shape[2])
+        inv_sqrt_d = 1.0 / math.sqrt(float(q_dim))
+        q_flat = np.ascontiguousarray(q.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        k_flat = np.ascontiguousarray(k.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        v_flat = np.ascontiguousarray(v.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        mask_flat = np.ascontiguousarray(mask.detach().to_numpy(), dtype=np.float32).reshape(-1)
+        out = q.zeros((batch_size, num_head, queries_len, d_head))
+        out_flat = out._tensor._storage
+        _lib_flash_full(
+            q_flat,
+            k_flat,
+            v_flat,
+            mask_flat,
+            out_flat,
+            ctypes.c_int(batch_size),
+            ctypes.c_int(num_head),
+            ctypes.c_int(queries_len),
+            ctypes.c_int(key_len),
+            ctypes.c_int(d_head),
+            ctypes.c_float(inv_sqrt_d),
+        )
         return out
 
     @staticmethod

@@ -7,8 +7,6 @@ import json
 import random
 import datasets
 import numpy as np
-import argparse
-from distutils.util import strtobool
 
 from sacrebleu.metrics import BLEU
 from transformers import AutoTokenizer
@@ -17,6 +15,29 @@ from tokenizers import ByteLevelBPETokenizer
 import minitorch
 from minitorch import DecoderLM
 from minitorch.cuda_kernel_ops import CudaKernelOps
+from project.checkpointing import (
+    load_model_weights,
+    save_model_weights,
+    save_model_config,
+    validate_model_config,
+)
+from project.generation import benchmark_generation
+
+
+def concat_translation_examples(examples, src_key, tgt_key, group_size):
+    if group_size <= 1:
+        return examples
+
+    grouped = []
+    for i in range(0, len(examples), group_size):
+        chunk = examples[i:i + group_size]
+        if len(chunk) < group_size:
+            break
+        grouped.append({
+            src_key: f" <eos_{src_key}> ".join(example[src_key] for example in chunk),
+            tgt_key: f" <eos_{tgt_key}> ".join(example[tgt_key] for example in chunk),
+        })
+    return grouped
 
 
 def get_dataset(dataset_name, model_max_length):
@@ -45,7 +66,7 @@ def get_dataset(dataset_name, model_max_length):
     return dataset, src_key, tgt_key
 
 
-def get_tokenizer(examples, vocab_size, src_key, tgt_key, workdir):
+def get_tokenizer(examples, vocab_size, src_key, tgt_key, workdir, reuse_if_available=True):
     """
     Trains a tokenizer on the provided dataset examples and saves the tokenizer configuration.
 
@@ -60,6 +81,17 @@ def get_tokenizer(examples, vocab_size, src_key, tgt_key, workdir):
     - tokenizer: The trained tokenizer with special tokens,
         e.g., ("<eos_de>", "<eos_en>", "<pad>") if src_key and tgt_key are "de" and "en", respectively.
     """
+    tokenizer_path = f'{workdir}/tokenizer.json'
+    config_path = f'{workdir}/config.json'
+
+    if reuse_if_available and os.path.exists(tokenizer_path) and os.path.exists(config_path):
+        return AutoTokenizer.from_pretrained(
+            workdir,
+            eos_token=None,
+            bos_token=None,
+            pad_token=None,
+            unk_token=None)
+
     tokenizer = ByteLevelBPETokenizer()
 
     # Customized training
@@ -68,8 +100,8 @@ def get_tokenizer(examples, vocab_size, src_key, tgt_key, workdir):
         vocab_size=vocab_size,
         special_tokens=[f'<eos_{src_key}>', f'<eos_{tgt_key}>', '<pad>'])
 
-    tokenizer.save(f'{workdir}/tokenizer.json')
-    json.dump({'model_type': 'gpt2'}, open(f'{workdir}/config.json', 'w'))
+    tokenizer.save(tokenizer_path)
+    json.dump({'model_type': 'gpt2'}, open(config_path, 'w'))
 
     tokenizer = AutoTokenizer.from_pretrained(
         workdir,
@@ -227,15 +259,6 @@ def train(model, optimizer, examples, n_samples, collate_fn, batch_size, desc):
             lr=optimizer.lr)
 
 
-def parse_args():
-    def str2bool(x):
-        return bool(strtobool(x))
-        
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--use-fused-kernel', type=str2bool, default=False)
-    return parser.parse_args()
-
-
 def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          model_max_length=40,
          n_epochs=1,
@@ -245,42 +268,68 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          n_vocab=10000,
          n_embd=256,
          seed=11111,
-         use_fused_kernel=False):
-    args = parse_args()
-             
+         use_fused_kernel=False,
+         load_weights_path=None,
+         save_weights_path=None,
+         run_generation_eval=False,
+         eval_concat_group_size=1,
+         generation_examples=5,
+         generation_max_new_tokens=32,
+         kv_cache_quantization='none'):
     np.random.seed(seed)
     random.seed(seed)
 
     workdir = f'./workdir_vocab{n_vocab}_lr{learning_rate}_embd{n_embd}'
-    os.makedirs(workdir, exist_ok=True)
+    if save_weights_path is not None:
+        artifact_dir = os.path.dirname(save_weights_path) or "."
+    elif load_weights_path is not None:
+        artifact_dir = os.path.dirname(load_weights_path) or "."
+    else:
+        artifact_dir = workdir
+    os.makedirs(artifact_dir, exist_ok=True)
 
     backend = minitorch.TensorBackend(CudaKernelOps)
     print("use_fused_kernel: ", use_fused_kernel)
+    print("kv_cache_quantization: ", kv_cache_quantization)
 
     config = {
         'n_vocab'     : n_vocab,  # vocab_size
         'n_embd'      : n_embd,   # n_embed
         'n_head'      : 8,    # n_head
         'n_positions' : model_max_length,  # n_ctx == n_positions
-        # 'n_layer'     : 4,    # n_layer
+        'n_layer'     : 4,    # n_layer
         'p_dropout'   : 0.1,  # x_pdrop
         'ln_eps'      : 1e-5, # layer_norm_epsilon
         'backend'     : backend,
         'use_fused_kernel': use_fused_kernel
     }
 
+    model_config_path = f"{artifact_dir}/model_config.json"
+    if load_weights_path is not None and os.path.exists(model_config_path):
+        validate_model_config(config=config, path=model_config_path)
+
     model = DecoderLM(**config)
     optimizer = minitorch.Adam(model.parameters(), lr=learning_rate)
 
+    if load_weights_path is not None:
+        load_model_weights(model=model, path=load_weights_path, backend=backend)
+        print(f"loaded model weights from {load_weights_path}")
+
     dataset, src_key, tgt_key = get_dataset(
         dataset_name=dataset_name, model_max_length=model_max_length)
+    dataset['test'] = concat_translation_examples(
+        dataset['test'],
+        src_key=src_key,
+        tgt_key=tgt_key,
+        group_size=eval_concat_group_size,
+    )
 
     tokenizer = get_tokenizer(
         examples=dataset['train'],
         vocab_size=config['n_vocab'],
         src_key=src_key,
         tgt_key=tgt_key,
-        workdir=workdir)
+        workdir=artifact_dir)
 
     collate_fn = partial(
         collate_batch,
@@ -301,6 +350,28 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
             batch_size=batch_size,
             collate_fn=collate_fn,
             desc=desc)
+
+    if save_weights_path is None:
+        save_weights_path = f"{artifact_dir}/model_weights.npz"
+    save_dir = os.path.dirname(save_weights_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    save_model_weights(model=model, path=save_weights_path)
+    print(f"saved model weights to {save_weights_path}")
+    save_model_config(config=config, path=f"{artifact_dir}/model_config.json")
+
+    if run_generation_eval:
+        benchmark_generation(
+            model=model,
+            examples=dataset['test'],
+            tokenizer=tokenizer,
+            src_key=src_key,
+            tgt_key=tgt_key,
+            backend=backend,
+            max_new_tokens=generation_max_new_tokens,
+            num_examples=generation_examples,
+            kv_cache_quantization=kv_cache_quantization,
+        )
 
 
 if __name__ == '__main__':

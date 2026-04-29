@@ -1,0 +1,8 @@
+mode,throughput_tok_s,speedup_vs_full,kv_cache_bytes,kv_cache_max_bytes,token_match_vs_full
+Full recompute,2.060881,1.000000,0,,
+KV cache (FP),2.267720,1.100364,995104,0,1.000000
+KV int8,2.260182,1.096707,251712,0,1.000000
+KV int4,2.239228,1.086539,127808,0,1.000000
+KV FP + budget,2.276440,1.104595,123360,131072,1.000000
+KV int8 + budget,2.249812,1.091675,131072,131072,1.000000
+KV int4 + budget,2.246841,1.090233,127808,131072,1.000000
